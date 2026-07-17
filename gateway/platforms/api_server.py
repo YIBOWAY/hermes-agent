@@ -993,6 +993,13 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        # V2.5 durable event-plane broker (only active when a durable_store is
+        # configured).  Per run: monotonically increasing seq, per-subscriber
+        # fan-out queues, and a terminal flag.  Canonical events live in the
+        # durable store; these structures are transport only.
+        self._run_event_seq: Dict[str, int] = {}
+        self._run_event_subscribers: Dict[str, list] = {}
+        self._run_event_terminal: set[str] = set()
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         # Concurrency cap shared across all agent-serving endpoints
         # (/v1/chat/completions, /v1/responses, /v1/runs). Read from
@@ -4637,6 +4644,91 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_statuses[run_id] = current
         return current
 
+    # ------------------------------------------------------------------
+    # /v1/runs — V2.5 durable event-plane broker (contract matrix §2 row 4)
+    # ------------------------------------------------------------------
+    #
+    # These helpers are active only when a durable_store is configured. They
+    # give each run event a stable event_id + per-run monotonic seq, persist it
+    # to the store (so it survives restart and SSE disconnect), and fan it out
+    # to every subscriber's own queue (so concurrent subscribers don't race a
+    # single shared queue). The legacy single-queue path is used when no store
+    # is configured.
+
+    def _broker_enabled(self) -> bool:
+        return self._durable_store is not None
+
+    def _broker_seed(self, run_id: str) -> None:
+        """Initialise broker state for a new run (idempotent)."""
+        self._run_event_seq.setdefault(run_id, 0)
+        self._run_event_subscribers.setdefault(run_id, [])
+
+    def _broker_publish(self, run_id: str, event: Optional[Dict[str, Any]]) -> None:
+        """Persist + fan out one event; ``None`` closes every subscriber queue.
+
+        Thread-safe: producers call this from the executor thread via
+        ``loop.call_soon_threadsafe``, so it always runs on the event loop.
+        """
+        if event is None:
+            self._run_event_terminal.add(run_id)
+            for q in list(self._run_event_subscribers.get(run_id, [])):
+                try:
+                    q.put_nowait(None)
+                except Exception:
+                    pass
+            return
+        self._broker_seed(run_id)
+        seq = self._run_event_seq[run_id] + 1
+        self._run_event_seq[run_id] = seq
+        event_type = str(event.get("event", "event"))
+        # Persist first: the store assigns the canonical event_id and the
+        # authoritative per-run seq. Fall back to the in-memory seq if the
+        # store is unreachable so live delivery is never blocked by storage.
+        try:
+            rec = self._durable_store.append_event(run_id, event_type, dict(event))
+            seq = rec.seq
+            event_id = rec.event_id
+        except Exception:
+            logger.exception("[api_server] durable append_event failed for run %s", run_id)
+            event_id = f"evt_{uuid.uuid4().hex}"
+        enriched = dict(event)
+        enriched["seq"] = seq
+        enriched["event_id"] = event_id
+        for q in list(self._run_event_subscribers.get(run_id, [])):
+            try:
+                q.put_nowait(enriched)
+            except Exception:
+                pass
+
+    def _broker_subscribe(self, run_id: str) -> "asyncio.Queue":
+        """Attach a new subscriber queue for a live run."""
+        self._broker_seed(run_id)
+        q: "asyncio.Queue" = asyncio.Queue()
+        self._run_event_subscribers[run_id].append(q)
+        return q
+
+    def _broker_unsubscribe(self, run_id: str, q: "asyncio.Queue") -> None:
+        subs = self._run_event_subscribers.get(run_id)
+        if subs is not None:
+            try:
+                subs.remove(q)
+            except ValueError:
+                pass
+
+    def _broker_is_terminal(self, run_id: str) -> bool:
+        if run_id in self._run_event_terminal:
+            return True
+        status = self._run_statuses.get(run_id, {})
+        return status.get("status") in {"completed", "failed", "cancelled"}
+
+    @staticmethod
+    def _sse_frame(event: Dict[str, Any]) -> bytes:
+        """One spec-compliant SSE frame: id + event + data."""
+        seq = event.get("seq")
+        event_type = event.get("event", "message")
+        head = f"id: {seq}\nevent: {event_type}\n" if seq is not None else f"event: {event_type}\n"
+        return f"{head}data: {json.dumps(event)}\n\n".encode()
+
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
         def _push(event: Dict[str, Any]) -> None:
@@ -4645,6 +4737,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._run_statuses.get(run_id, {}).get("status", "running"),
                 last_event=event.get("event"),
             )
+            if self._broker_enabled():
+                try:
+                    loop.call_soon_threadsafe(self._broker_publish, run_id, event)
+                except Exception:
+                    pass
+                return
             q = self._run_streams.get(run_id)
             if q is None:
                 return
@@ -4812,6 +4910,21 @@ class APIServerAdapter(BasePlatformAdapter):
         else:
             run_id = f"run_{uuid.uuid4().hex}"
             session_id = body.get("session_id") or stored_session_id or run_id
+        # Ensure a durable run row exists whenever the broker is active so
+        # events/approvals have a parent (contract row 9). Keyed submissions were
+        # already persisted by submit_or_get; this registers server-minted runs.
+        # Never block a run on storage failure.
+        if self._broker_enabled():
+            try:
+                self._durable_store.register_run(
+                    run_id=run_id,
+                    session_id=session_id,
+                    idempotency_key=idempotency_key,
+                    request_body=body,
+                )
+                self._broker_seed(run_id)
+            except Exception:
+                logger.exception("[api_server] durable register_run failed for %s", run_id)
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
         # conversation/memory scopes, not authorization namespaces: multiple
@@ -4830,6 +4943,12 @@ class APIServerAdapter(BasePlatformAdapter):
 
         def _put_event_if_active(event: Optional[Dict]) -> None:
             """Enqueue only while this run still owns live transport state."""
+            if self._broker_enabled():
+                # Broker path: publish is the single funnel for every event and
+                # the close sentinel. Guard against post-close stragglers.
+                if event is None or self._run_streams.get(run_id) is q:
+                    self._broker_publish(run_id, event)
+                return
             if self._run_streams.get(run_id) is q:
                 q.put_nowait(event)
 
@@ -5107,6 +5226,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = request.match_info["run_id"]
 
+        if self._broker_enabled():
+            return await self._handle_run_events_durable(request, run_id)
+
         # Allow subscribing slightly before the run is registered (race condition window)
         for _ in range(20):
             if run_id in self._run_streams:
@@ -5147,6 +5269,114 @@ class APIServerAdapter(BasePlatformAdapter):
             self._run_stream_subscribers.discard(run_id)
             self._run_streams.pop(run_id, None)
             self._run_streams_created.pop(run_id, None)
+
+        return response
+
+    async def _handle_run_events_durable(
+        self, request: "web.Request", run_id: str
+    ) -> "web.StreamResponse":
+        """Durable, cursor-resumable SSE for runs (contract matrix §2 row 4).
+
+        Canonical events live in the durable store, so SSE disconnect never
+        deletes them and a fresh cursor (``?since={seq}`` or ``Last-Event-ID``)
+        replays with no gap/dup. Each subscriber gets its own fan-out queue, so
+        concurrent subscribers don't race one shared queue.
+        """
+        # Resolve the resume cursor BEFORE prepare() (headers/status are fixed
+        # after). Last-Event-ID takes precedence over the ?since= query param.
+        cursor = 0
+        raw_cursor = request.headers.get("Last-Event-ID") or request.query.get("since")
+        if raw_cursor:
+            try:
+                cursor = max(0, int(str(raw_cursor).strip()))
+            except (TypeError, ValueError):
+                return web.json_response(
+                    _openai_error("Invalid resume cursor", code="invalid_cursor"),
+                    status=400,
+                )
+
+        terminal = self._broker_is_terminal(run_id)
+        known = (
+            terminal
+            or run_id in self._run_event_subscribers
+            or run_id in self._run_streams
+            or run_id in self._run_statuses
+            or (self._durable_store.get_run(run_id) is not None)
+        )
+        if not known:
+            # Allow subscribing slightly before the run is registered (race window).
+            for _ in range(20):
+                if run_id in self._run_statuses or self._durable_store.get_run(run_id):
+                    known = True
+                    break
+                await asyncio.sleep(0.05)
+            if not known:
+                return web.json_response(
+                    _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                    status=404,
+                )
+
+        # Durable backlog strictly after the cursor (no gap, no dup).
+        try:
+            backlog = self._durable_store.replay_events(run_id, since_seq=cursor)
+        except Exception:
+            logger.exception("[api_server] durable replay failed for run %s", run_id)
+            backlog = []
+
+        live_q = None
+        if not terminal:
+            live_q = self._broker_subscribe(run_id)
+            self._run_stream_subscribers.add(run_id)
+
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+        await response.prepare(request)
+
+        try:
+            # 1) Replay the durable backlog (spec-compliant frames with id:/event:).
+            last_sent = cursor
+            for rec in backlog:
+                if rec.seq <= last_sent:
+                    continue  # belt-and-suspenders: no duplicate across the seam
+                frame = {"seq": rec.seq, "event": rec.event_type, **rec.payload}
+                await response.write(self._sse_frame(frame))
+                last_sent = rec.seq
+
+            # 2) Bridge to live fan-out for a still-running run.
+            if live_q is not None:
+                while True:
+                    try:
+                        event = await asyncio.wait_for(live_q.get(), timeout=30.0)
+                    except asyncio.TimeoutError:
+                        if self._broker_is_terminal(run_id):
+                            await response.write(b": stream closed\n\n")
+                            break
+                        await response.write(b": keepalive\n\n")
+                        continue
+                    if event is None:
+                        await response.write(b": stream closed\n\n")
+                        break
+                    ev_seq = event.get("seq")
+                    if ev_seq is not None and ev_seq <= last_sent:
+                        continue  # already replayed from the durable backlog
+                    await response.write(self._sse_frame(event))
+                    if ev_seq is not None:
+                        last_sent = ev_seq
+            else:
+                # Terminal run: backlog fully replayed, close immediately.
+                await response.write(b": stream closed\n\n")
+        except Exception as exc:
+            logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
+        finally:
+            if live_q is not None:
+                self._broker_unsubscribe(run_id, live_q)
+            self._run_stream_subscribers.discard(run_id)
 
         return response
 
@@ -5219,18 +5449,27 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         self._set_run_status(run_id, "running", last_event="approval.responded")
-        q = self._run_streams.get(run_id)
-        if q is not None:
-            try:
-                q.put_nowait({
-                    "event": "approval.responded",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "choice": choice,
-                    "resolved": resolved,
-                })
-            except Exception:
-                pass
+        if self._broker_enabled():
+            self._broker_publish(run_id, {
+                "event": "approval.responded",
+                "run_id": run_id,
+                "timestamp": time.time(),
+                "choice": choice,
+                "resolved": resolved,
+            })
+        else:
+            q = self._run_streams.get(run_id)
+            if q is not None:
+                try:
+                    q.put_nowait({
+                        "event": "approval.responded",
+                        "run_id": run_id,
+                        "timestamp": time.time(),
+                        "choice": choice,
+                        "resolved": resolved,
+                    })
+                except Exception:
+                    pass
 
         return web.json_response({
             "object": "hermes.run.approval_response",

@@ -268,6 +268,57 @@ class DurableRunStore:
             ).fetchone()
         return dict(row) if row is not None else None
 
+    def register_run(
+        self,
+        *,
+        run_id: str,
+        session_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        request_body: Optional[dict[str, Any]] = None,
+        requested_policy: Optional[str] = None,
+    ) -> str:
+        """Ensure a durable run row exists; return run_id.
+
+        ``submit_or_get`` already persists keyed submissions. This registers
+        server-minted runs (no Idempotency-Key) so their events/approvals have a
+        parent row (contract row 9). Idempotent on ``run_id``: re-registering
+        the same run is a no-op, so a later ``submit_or_get`` recovery or a
+        duplicate registration never errors.
+        """
+
+        def _op(conn: sqlite3.Connection) -> str:
+            if (
+                conn.execute(
+                    "SELECT 1 FROM runs WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                is not None
+            ):
+                return run_id
+            now = time.time()
+            digest = (
+                canonical_digest(request_body)
+                if request_body is not None
+                else f"server:{run_id}"
+            )
+            conn.execute(
+                "INSERT INTO runs (run_id, idempotency_key, request_digest, status,"
+                " session_id, requested_policy, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    idempotency_key or f"server:{run_id}",
+                    digest,
+                    RunState.QUEUED.value,
+                    session_id or run_id,
+                    requested_policy,
+                    now,
+                    now,
+                ),
+            )
+            return run_id
+
+        return self._write(_op)
+
     # -- row 1 state machine: guarded transitions + terminal immutability ----
 
     def transition(
