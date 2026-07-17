@@ -937,9 +937,13 @@ class APIServerAdapter(BasePlatformAdapter):
     # should complete the interrupted work rather than acknowledge (#57056).
     interactive_resume: bool = False
 
-    def __init__(self, config: PlatformConfig):
+    def __init__(self, config: PlatformConfig, durable_store: Optional[Any] = None):
         super().__init__(config, Platform.API_SERVER)
         extra = config.extra or {}
+        # Optional DurableRunAuthority store (gateway.durable_runs.DurableRunStore).
+        # When None, /v1/runs keeps its legacy in-memory-only behavior; when set,
+        # POST /v1/runs honors Idempotency-Key via durable submit-or-get (V2.2).
+        self._durable_store = durable_store
         self._host: str = extra.get("host", os.getenv("API_SERVER_HOST", DEFAULT_HOST))
         raw_port = extra.get("port")
         if raw_port is None:
@@ -1534,6 +1538,12 @@ class APIServerAdapter(BasePlatformAdapter):
     # (e.g. ``agent:main:webui:dm:user-42``) while staying small enough
     # that the sanitized form is safe to pass into Honcho / state.db.
     _MAX_SESSION_HEADER_LEN = 256
+
+    # Soft length cap for the Idempotency-Key header.  Bounded in aggregate by
+    # aiohttp, but capped tighter here so a caller can't burn memory / bloat the
+    # durable store's primary key with a multi-kilobyte "key".  256 chars is far
+    # above any realistic idempotency token (a UUID is 36).
+    _MAX_IDEMPOTENCY_KEY_LEN = 256
 
     def _parse_session_key_header(
         self, request: "web.Request"
@@ -4747,8 +4757,61 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
-        run_id = f"run_{uuid.uuid4().hex}"
-        session_id = body.get("session_id") or stored_session_id or run_id
+        # V2.2 (contract matrix §2 rows 1/2): honor the caller's Idempotency-Key
+        # with a durable submit-or-get against the canonical request digest.
+        # Same identity (key + same semantic body) ⇒ recover the SAME Run without
+        # re-executing; same key with a different digest ⇒ 409 (fail closed). When
+        # no key is supplied, or no durable store is configured, behavior is
+        # unchanged (a fresh run is minted below).
+        idempotency_key = request.headers.get("Idempotency-Key") or None
+        if idempotency_key is not None:
+            idempotency_key = idempotency_key.strip() or None
+        if idempotency_key is not None and len(idempotency_key) > self._MAX_IDEMPOTENCY_KEY_LEN:
+            return web.json_response(
+                _openai_error(
+                    "Idempotency-Key exceeds maximum length",
+                    code="idempotency_key_too_long",
+                ),
+                status=400,
+            )
+        if idempotency_key is not None and self._durable_store is not None:
+            from gateway.durable_runs import ConflictError
+
+            try:
+                submit = self._durable_store.submit_or_get(
+                    idempotency_key=idempotency_key,
+                    request_body=body,
+                )
+            except ConflictError:
+                return web.json_response(
+                    _openai_error(
+                        "Idempotency-Key was already used with a different request",
+                        code="idempotency_conflict",
+                    ),
+                    status=409,
+                )
+            if not submit.created:
+                # Recovery: return the existing Run; never re-spawn it.
+                response_headers = (
+                    {"X-Hermes-Session-Key": gateway_session_key}
+                    if gateway_session_key
+                    else {}
+                )
+                return web.json_response(
+                    {
+                        "run_id": submit.run_id,
+                        "status": "recovered",
+                        "idempotent_replay": True,
+                        "idempotency_key": idempotency_key,
+                    },
+                    status=202,
+                    headers=response_headers,
+                )
+            run_id = submit.run_id
+            session_id = body.get("session_id") or stored_session_id or run_id
+        else:
+            run_id = f"run_{uuid.uuid4().hex}"
+            session_id = body.get("session_id") or stored_session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
         # conversation/memory scopes, not authorization namespaces: multiple
