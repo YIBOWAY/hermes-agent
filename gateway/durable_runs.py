@@ -530,6 +530,26 @@ class DurableRunStore:
 
         return self._write(_op)
 
+    def release_approval_consume(self, challenge_id: str) -> bool:
+        """Undo a successful consume when the live resolve did not take effect.
+
+        Plan A6: a non-success approval path must not change the prior fact.
+        If the adapter CAS-consumed the grant and then ``resolve_gateway_approval``
+        returned 0 (empty queue / race / restart), restore ``consumed=0`` so the
+        client can retry with the same challenge. Only un-burns a currently
+        consumed row; never touches unconsumed/foreign rows.
+        """
+
+        def _op(conn: sqlite3.Connection) -> bool:
+            cur = conn.execute(
+                "UPDATE approval_grants SET consumed = 0"
+                " WHERE challenge_id = ? AND consumed = 1",
+                (challenge_id,),
+            )
+            return cur.rowcount == 1
+
+        return self._write(_op)
+
     def get_approval_challenge(self, challenge_id: str) -> Optional[dict[str, Any]]:
         """Fetch an approval grant row (for run-binding checks), or None."""
         with self._lock:

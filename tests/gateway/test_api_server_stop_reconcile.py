@@ -223,3 +223,31 @@ class TestRestartReconcile:
         adapter.reconcile_durable_runs()  # second pass: no error, no change
 
         assert store.get_run("run_p")["status"] == RunState.STOPPED.value
+
+
+class TestIdempotentStopPreservesTerminalFact:
+    @pytest.mark.asyncio
+    async def test_stop_on_succeeded_returns_succeeded_not_stopped(self, store):
+        """Idempotent stop must report actual terminal status, not coerce to stopped."""
+        from gateway.durable_runs import RunState
+
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            run_id = await _run_to_terminal(adapter, cli)
+            row = store.get_run(run_id)
+            assert row["status"] == RunState.SUCCEEDED.value
+
+            first = await cli.post(f"/v1/runs/{run_id}/stop")
+            assert first.status == 200
+            first_body = await first.json()
+            assert first_body["status"] == "succeeded"
+            assert first_body.get("idempotent_replay") is True
+
+            second = await cli.post(f"/v1/runs/{run_id}/stop")
+            assert second.status == 200
+            second_body = await second.json()
+            assert second_body == first_body
+
+            # Store fact unchanged.
+            assert store.get_run(run_id)["status"] == RunState.SUCCEEDED.value
