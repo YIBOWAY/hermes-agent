@@ -520,3 +520,13 @@ class DurableRunStore:
             return cur.rowcount == 1
 
         return self._write(_op)
+
+    def get_approval_challenge(self, challenge_id: str) -> Optional[dict[str, Any]]:
+        """Fetch an approval grant row (for run-binding checks), or None."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT challenge_id, run_id, action_digest, expires_at, consumed,"
+                " created_at FROM approval_grants WHERE challenge_id = ?",
+                (challenge_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None

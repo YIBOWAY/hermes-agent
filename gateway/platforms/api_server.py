@@ -91,6 +91,7 @@ from gateway.platforms.base import (
 )
 from agent.redact import redact_sensitive_text
 from gateway.readiness import collect_runtime_readiness
+from gateway.durable_runs import canonical_digest
 
 logger = logging.getLogger(__name__)
 
@@ -4628,6 +4629,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
+    _APPROVAL_CHALLENGE_TTL = 300  # seconds an approval challenge stays consumable
 
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
@@ -5075,6 +5077,29 @@ class APIServerAdapter(BasePlatformAdapter):
                         from gateway.run import _redact_approval_command
 
                         event["command"] = _redact_approval_command(event.get("command"))
+                    # V2.7 (contract row 6): issue an exact durable challenge bound
+                    # to this run + a canonical digest of the gated action. The
+                    # client must echo challenge_id + action_digest back to consume
+                    # (single-use + TTL + CAS). Broker-only; legacy path unchanged.
+                    if self._broker_enabled():
+                        action_digest = canonical_digest({
+                            "command": event.get("command"),
+                            "description": event.get("description"),
+                            "pattern_keys": event.get("pattern_keys"),
+                        })
+                        try:
+                            ch = self._durable_store.issue_approval_challenge(
+                                run_id,
+                                action_digest=action_digest,
+                                ttl_seconds=self._APPROVAL_CHALLENGE_TTL,
+                            )
+                            event["challenge_id"] = ch.challenge_id
+                            event["action_digest"] = action_digest
+                            event["expires_at"] = ch.expires_at
+                        except Exception:
+                            logger.exception(
+                                "[api_server] issue_approval_challenge failed for %s", run_id
+                            )
                     event.update({
                         "event": "approval.request",
                         "run_id": run_id,
@@ -5090,7 +5115,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="approval.request",
                     )
                     try:
-                        loop.call_soon_threadsafe(q.put_nowait, event)
+                        if self._broker_enabled():
+                            loop.call_soon_threadsafe(self._broker_publish, run_id, event)
+                        else:
+                            loop.call_soon_threadsafe(q.put_nowait, event)
                     except Exception:
                         pass
 
@@ -5528,6 +5556,45 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 status=400,
             )
+
+        # V2.7 (contract row 6): when a durable store is configured, an approval
+        # response must present the exact challenge (challenge_id + matching
+        # action_digest) and consume it — single-use + TTL + compare-and-swap.
+        # A stale / expired / digest-mismatched / replayed / cross-run grant is
+        # rejected with 409 and NEVER resolves the queue; a failed consume leaves
+        # the real grant intact. Legacy path (no store) is unchanged below.
+        if self._broker_enabled():
+            challenge_id = body.get("challenge_id")
+            action_digest = body.get("action_digest")
+            if not challenge_id or not action_digest:
+                return web.json_response(
+                    _openai_error(
+                        "Approval requires challenge_id and action_digest",
+                        code="approval_challenge_required",
+                    ),
+                    status=409,
+                )
+            grant = self._durable_store.get_approval_challenge(str(challenge_id))
+            if grant is None or grant.get("run_id") != run_id:
+                # Unknown challenge, or one issued for a different run.
+                return web.json_response(
+                    _openai_error(
+                        "Approval challenge is invalid for this run",
+                        code="approval_challenge_invalid",
+                    ),
+                    status=409,
+                )
+            consumed = self._durable_store.consume_approval(
+                str(challenge_id), action_digest=str(action_digest)
+            )
+            if not consumed:
+                return web.json_response(
+                    _openai_error(
+                        "Approval challenge is stale, expired, already used, or mismatched",
+                        code="approval_challenge_invalid",
+                    ),
+                    status=409,
+                )
 
         approval_session_key = self._run_approval_sessions.get(run_id)
         if not approval_session_key:
