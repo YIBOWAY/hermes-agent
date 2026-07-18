@@ -92,8 +92,14 @@ from gateway.platforms.base import (
 from agent.redact import redact_sensitive_text
 from gateway.readiness import collect_runtime_readiness
 from gateway.durable_runs import canonical_digest
+from gateway.relay.descriptor import CONTRACT_VERSION as _RELAY_CONTRACT_VERSION
 
 logger = logging.getLogger(__name__)
+
+# Schema version advertised on ``GET /v1/capabilities`` when the durable
+# behavioral probe (V2.9) is active. Tracks the relay descriptor's additive-only
+# contract version so platform/upstream negotiate the same schema idiom.
+RELAY_CONTRACT_VERSION = _RELAY_CONTRACT_VERSION
 
 
 def _hermes_version() -> str:
@@ -1977,7 +1983,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
-        return web.json_response({
+        payload = {
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
             "model": self._model_name,
@@ -2044,7 +2050,91 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
             },
-        })
+        }
+
+        # V2.9 (contract row 8): additive behavioral probe. Only when a durable
+        # store is configured do we additively surface a contract_version and a
+        # `durable` block whose per-capability `grounded` is backed by a
+        # side-effect-free read-only store probe — never a bare "configured"
+        # flag, and never a mutating write. Legacy (no-store) payload above is
+        # byte-identical to before.
+        if self._broker_enabled():
+            payload["contract_version"] = RELAY_CONTRACT_VERSION
+            payload["durable"] = self._capability_probes()
+
+        return web.json_response(payload)
+
+    # Bogus ids used only for read-only schema/connectivity probes. Real run
+    # ids are ``run_<32 hex>`` (see ``_handle_runs``), so this prefix can never
+    # collide with a real row — the probe must return "no row / empty", which
+    # is exactly what proves the table is present and readable.
+    _PROBE_RUN_ID = "run_capprobe_deadbeef"
+    _PROBE_CHALLENGE_ID = "ch_capprobe_deadbeef"
+
+    def _capability_probes(self) -> Dict[str, Dict[str, Any]]:
+        """Behavioral capability probe for ``GET /v1/capabilities`` (V2.9).
+
+        Each durable capability is reported as ``{supported, grounded,
+        evidence}``:
+
+        * ``supported`` — the code path exists (a durable store is configured).
+        * ``grounded`` — a *read-only, side-effect-free* store probe succeeded,
+          proving the underlying table is present and answers. We deliberately
+          never probe with a mutating write (``submit_or_get`` / ``append_event``
+          / ``consume_approval``): advertising a capability must not change
+          state. The single genuine live round-trip is ``replay_events`` (a
+          pure ``SELECT``); the rest are schema/connectivity reads against a
+          bogus id that must return "no row / empty".
+        * ``evidence`` — names the grounding signal (which probe), so a caller
+          can see *why* the capability is believed.
+
+        Fail-closed: any probe that raises degrades that capability to
+        ``grounded=False`` rather than claiming support on a stale flag.
+        """
+        store = self._durable_store
+
+        def _probe(evidence: str, read) -> Dict[str, Any]:
+            try:
+                read()
+            except Exception:  # fail-closed: a broken store is not grounded
+                logger.debug("capability probe failed for %s", evidence, exc_info=True)
+                return {"supported": True, "grounded": False, "evidence": evidence}
+            return {"supported": True, "grounded": True, "evidence": evidence}
+
+        return {
+            # Idempotency: grounded by the runs table answering a read (the
+            # write path submit_or_get is never exercised as a probe).
+            "idempotency": _probe(
+                "store.get_run",
+                lambda: store.get_run(self._PROBE_RUN_ID),
+            ),
+            # Event replay: the only true side-effect-free round-trip — a pure
+            # SELECT over run_events.
+            "event_replay": _probe(
+                "store.replay_events",
+                lambda: store.replay_events(self._PROBE_RUN_ID, since_seq=0),
+            ),
+            # Approval CAS: grounded by the approval_grants table answering a
+            # read; consume_approval (mutating CAS) is never used as a probe.
+            "approval_cas": _probe(
+                "store.get_approval_challenge",
+                lambda: store.get_approval_challenge(self._PROBE_CHALLENGE_ID),
+            ),
+            # Idempotent stop + restart reconcile + run status all read runs.
+            "idempotent_stop": _probe(
+                "store.get_run",
+                lambda: store.get_run(self._PROBE_RUN_ID),
+            ),
+            "restart_reconcile": _probe(
+                "store.list_non_terminal_runs",
+                lambda: store.list_non_terminal_runs(),
+            ),
+            # requested/actual evidence lives in the runs row's evidence cols.
+            "run_evidence": _probe(
+                "store.get_run",
+                lambda: store.get_run(self._PROBE_RUN_ID),
+            ),
+        }
 
     async def _handle_skills(self, request: "web.Request") -> "web.Response":
         """GET /v1/skills — list installed skills visible to the API-server agent.
