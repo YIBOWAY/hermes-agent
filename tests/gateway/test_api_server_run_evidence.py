@@ -226,3 +226,117 @@ class TestEvidenceDurability:
 
         assert data.get("requested_policy", {}).get("model") == "persist-me"
         assert data.get("usage", {}).get("total_tokens") == 15
+
+
+class TestPostFallbackEvidence:
+    """V2.6b — actual_policy + fallback_reason must reflect a REAL post-fallback route.
+
+    V2.6's original writer set actual_policy.model to the requested/default model
+    and hardcoded fallback_reason=None, so GET /v1/runs could never show that a
+    fallback served the run. The adapter must read the live agent's
+    agent.model / agent.provider / agent._fallback_activated after
+    run_conversation and persist the real route + a reason.
+    """
+
+    def _fallback_agent(self, *, model: str, provider: str, activated: bool = True):
+        mock_agent = _completed_agent()
+        # Real strings (NOT MagicMock defaults) so the writer can distinguish a
+        # real AIAgent from a bare MagicMock used by the existing helpers.
+        mock_agent.model = model
+        mock_agent.provider = provider
+        mock_agent._fallback_activated = activated
+        return mock_agent
+
+    @pytest.mark.asyncio
+    async def test_fallback_records_actual_model_and_reason(self, store):
+        """When the agent falls back, actual_policy.model is the FALLBACK model
+        and fallback_reason is a non-empty string naming that model — not null
+        and not the requested model."""
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_create.return_value = self._fallback_agent(
+                    model="fallback-y", provider="custom", activated=True
+                )
+                resp = await cli.post(
+                    "/v1/runs", json={"input": "hi", "model": "primary-x"}
+                )
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+                status = None
+                for _ in range(100):
+                    status = (await (await cli.get(f"/v1/runs/{run_id}")).json()).get(
+                        "status"
+                    )
+                    if status in {"completed", "failed", "cancelled"}:
+                        break
+                    await asyncio.sleep(0.05)
+                assert status == "completed"
+
+                resp = await cli.get(f"/v1/runs/{run_id}")
+                data = await resp.json()
+
+        # requested is the client's model and is never overwritten.
+        assert data.get("requested_policy", {}).get("model") == "primary-x"
+        # actual is the agent's post-fallback model, NOT the requested one.
+        assert data.get("actual_policy", {}).get("model") == "fallback-y"
+        assert data.get("actual_policy", {}).get("provider") == "custom"
+        # A real reason is recorded (not None).
+        reason = data.get("fallback_reason")
+        assert isinstance(reason, str) and reason
+        assert "fallback-y" in reason
+
+    @pytest.mark.asyncio
+    async def test_no_fallback_leaves_reason_none_and_uses_agent_model(self, store):
+        """When no fallback fired, fallback_reason stays None and actual_policy
+        still prefers the agent's model (the real executing model) over the
+        advertised default."""
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_create.return_value = self._fallback_agent(
+                    model="primary-x", provider="custom", activated=False
+                )
+                resp = await cli.post(
+                    "/v1/runs", json={"input": "hi", "model": "primary-x"}
+                )
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+                for _ in range(100):
+                    status = (await (await cli.get(f"/v1/runs/{run_id}")).json()).get(
+                        "status"
+                    )
+                    if status in {"completed", "failed", "cancelled"}:
+                        break
+                    await asyncio.sleep(0.05)
+
+                resp = await cli.get(f"/v1/runs/{run_id}")
+                data = await resp.json()
+
+        assert data.get("requested_policy", {}).get("model") == "primary-x"
+        assert data.get("actual_policy", {}).get("model") == "primary-x"
+        assert data.get("actual_policy", {}).get("provider") == "custom"
+        assert data.get("fallback_reason") is None
+
+    @pytest.mark.asyncio
+    async def test_bare_magicmock_agent_does_not_fabricate_fallback(self, store):
+        """Regression: a bare MagicMock agent (existing helpers) must NOT be
+        treated as a fallback — bool(MagicMock()) is True, so the writer must
+        require _fallback_activated is literally True and model/provider are
+        real strings."""
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            # _run_to_terminal uses a bare MagicMock with no model/provider set.
+            run_id = await _run_to_terminal(
+                adapter, cli, {"input": "hi", "model": "my-model"}
+            )
+            resp = await cli.get(f"/v1/runs/{run_id}")
+            data = await resp.json()
+
+        # No fabricated fallback reason from a bare MagicMock.
+        assert data.get("fallback_reason") is None
+        # requested still recorded.
+        assert data.get("requested_policy", {}).get("model") == "my-model"

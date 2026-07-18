@@ -4926,28 +4926,69 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]],
         fallback_model: Optional[str],
         usage: Optional[Dict[str, Any]],
+        agent: Optional[Any] = None,
     ) -> None:
-        """V2.6 (contract row 5): persist ACTUAL provider/model + usage + fallback.
+        """V2.6/V2.6b (contract row 5): persist ACTUAL provider/model + usage + fallback.
 
         Never touches requested_policy. Best-effort: storage failure must not
         mask the run's terminal transition.
+
+        V2.6b: prefer the live agent's post-run model/provider (mutated in-place
+        on fallback via ``agent._fallback_activated``) over the pre-run route /
+        advertised default. A real fallback stamps a non-empty
+        ``fallback_reason``; a bare MagicMock agent (no real string attrs) is
+        never treated as a fallback.
         """
         if not self._broker_enabled():
             return
         try:
+            # Prefer the live agent's post-run route. AIAgent mutates
+            # agent.model/provider in-place on fallback and sets
+            # _fallback_activated=True (chat_completion_helpers.py /
+            # agent_init.py). Require real strings + a literal True so a bare
+            # MagicMock (bool(MagicMock()) is True; attrs are MagicMocks) never
+            # fabricates a fallback.
+            agent_model = getattr(agent, "model", None) if agent is not None else None
+            agent_provider = getattr(agent, "provider", None) if agent is not None else None
+            agent_model_s = agent_model if isinstance(agent_model, str) and agent_model else None
+            agent_provider_s = (
+                agent_provider if isinstance(agent_provider, str) and agent_provider else None
+            )
+            fallback_activated = (
+                agent is not None
+                and getattr(agent, "_fallback_activated", False) is True
+                and agent_model_s is not None
+            )
+
             actual_policy: Dict[str, Any] = {}
-            if route and route.get("model"):
+            if agent_model_s is not None:
+                actual_policy["model"] = agent_model_s
+            elif route and route.get("model"):
                 actual_policy["model"] = route.get("model")
             elif self._model_name:
                 actual_policy["model"] = self._model_name
-            if route and route.get("provider"):
+            if agent_provider_s is not None:
+                actual_policy["provider"] = agent_provider_s
+            elif route and route.get("provider"):
                 actual_policy["provider"] = route.get("provider")
             if fallback_model:
+                # The configured authorized chain (for audit); not which entry fired.
                 actual_policy["fallback_model"] = fallback_model
+
+            fallback_reason: Optional[str] = None
+            if fallback_activated:
+                # Reason names the activated model so a consumer can distinguish
+                # "which entry of the authorized chain served this run".
+                fallback_reason = f"fallback_activated:{agent_model_s}"
+                if agent_provider_s:
+                    fallback_reason = (
+                        f"fallback_activated:{agent_model_s} via {agent_provider_s}"
+                    )
+
             self._durable_store.record_run_outcome(
                 run_id,
                 actual_policy=actual_policy or None,
-                fallback_reason=None,
+                fallback_reason=fallback_reason,
                 usage=usage,
             )
         except Exception:
@@ -5382,7 +5423,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         "error": error_msg,
                     })
                     self._record_run_outcome(
-                        run_id, route=route, fallback_model=fallback_model, usage=usage
+                        run_id,
+                        route=route,
+                        fallback_model=fallback_model,
+                        usage=usage,
+                        agent=agent,
                     )
                     self._set_run_status(
                         run_id,
@@ -5400,7 +5445,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         "usage": usage,
                     })
                     self._record_run_outcome(
-                        run_id, route=route, fallback_model=fallback_model, usage=usage
+                        run_id,
+                        route=route,
+                        fallback_model=fallback_model,
+                        usage=usage,
+                        agent=agent,
                     )
                     self._set_run_status(
                         run_id,
@@ -5411,7 +5460,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
             except asyncio.CancelledError:
                 self._record_run_outcome(
-                    run_id, route=route, fallback_model=fallback_model, usage=None
+                    run_id,
+                    route=route,
+                    fallback_model=fallback_model,
+                    usage=None,
+                    agent=locals().get("agent"),
                 )
                 self._set_run_status(
                     run_id,
@@ -5430,7 +5483,11 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.exception("[api_server] run %s failed", run_id)
                 self._record_run_outcome(
-                    run_id, route=route, fallback_model=fallback_model, usage=None
+                    run_id,
+                    route=route,
+                    fallback_model=fallback_model,
+                    usage=None,
+                    agent=locals().get("agent"),
                 )
                 self._set_run_status(
                     run_id,
