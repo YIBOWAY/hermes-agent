@@ -91,7 +91,8 @@ from gateway.platforms.base import (
 )
 from agent.redact import redact_sensitive_text
 from gateway.readiness import collect_runtime_readiness
-from gateway.durable_runs import canonical_digest
+from utils import is_truthy_value
+from gateway.durable_runs import DurableRunStore, canonical_digest
 from gateway.relay.descriptor import CONTRACT_VERSION as _RELAY_CONTRACT_VERSION
 
 logger = logging.getLogger(__name__)
@@ -919,6 +920,42 @@ try:
     from tools.cronjob_tools import _scan_cron_prompt as _scan_cron_prompt
 except Exception:  # pragma: no cover - scanner is optional hardening
     _scan_cron_prompt = None
+
+
+def build_durable_store(
+    config: PlatformConfig, *, hermes_home: Optional[Any] = None
+) -> Optional[DurableRunStore]:
+    """Construct the DurableRunAuthority store when enabled, else ``None``.
+
+    V2.13: the reviewed durable-run semantics (V2.2–V2.9) are dormant unless a
+    store is passed to ``APIServerAdapter`` (``_broker_enabled()`` is simply
+    ``store is not None``). This is the single, unit-testable construction
+    point ``gateway/run.py`` uses, and it is **opt-in / default-OFF** so the
+    legacy in-memory ``/v1/runs`` behavior stays byte-identical unless enabled.
+
+    Enable via ``platforms.api_server.extra.durable_runs_enabled`` (an explicit
+    value wins over the env var) or the ``API_SERVER_DURABLE_RUNS`` env var.
+    The SQLite DB lives at ``<hermes_home>/durable_runs.db`` so each
+    profile/instance (``HERMES_HOME``) gets its own store; override with
+    ``extra.durable_runs_db`` or the ``API_SERVER_DURABLE_RUNS_DB`` env var.
+    When disabled this is side-effect-free — no store is constructed and no DB
+    file is created.
+    """
+    extra = config.extra or {}
+    enabled_raw = extra.get("durable_runs_enabled")
+    if enabled_raw is None:
+        enabled_raw = os.getenv("API_SERVER_DURABLE_RUNS")
+    if not is_truthy_value(enabled_raw, default=False):
+        return None
+    db_path = extra.get("durable_runs_db") or os.getenv("API_SERVER_DURABLE_RUNS_DB")
+    if not db_path:
+        home = hermes_home
+        if home is None:
+            from hermes_cli.config import get_hermes_home
+
+            home = get_hermes_home()
+        db_path = str(Path(home) / "durable_runs.db")
+    return DurableRunStore(db_path=str(db_path))
 
 
 class APIServerAdapter(BasePlatformAdapter):
