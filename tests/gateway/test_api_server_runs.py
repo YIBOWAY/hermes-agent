@@ -363,7 +363,11 @@ class TestRunEvents:
         adapter._run_approval_sessions[run_id] = "session-123"
 
         async with TestClient(TestServer(app)) as cli:
-            with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+            # V2.14 B1 pre-checks has_blocking_approval before resolve so a
+            # non-success path never burns the durable grant. Stub both sides.
+            with patch("tools.approval.has_blocking_approval", return_value=True), patch(
+                "tools.approval.resolve_gateway_approval", return_value=1
+            ) as mock_resolve:
                 approval_resp = await cli.post(
                     f"/v1/runs/{run_id}/approval",
                     json={"choice": "once", "all": "false"},
