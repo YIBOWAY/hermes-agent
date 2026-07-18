@@ -319,6 +319,59 @@ class DurableRunStore:
 
         return self._write(_op)
 
+    # -- row 5: requested vs actual provider/model/fallback/usage evidence ----
+
+    def set_requested_policy(self, run_id: str, requested_policy: dict[str, Any]) -> bool:
+        """Record the run's REQUESTED policy (the client's model + resolved route).
+
+        Set once at submission; later actual-route recording never overwrites it
+        (contract row 5: the requested route is never rewritten by the accounted
+        route). Returns False for an unknown run (fail closed).
+        """
+
+        def _op(conn: sqlite3.Connection) -> bool:
+            cur = conn.execute(
+                "UPDATE runs SET requested_policy = ?, updated_at = ? WHERE run_id = ?",
+                (json.dumps(requested_policy, ensure_ascii=False, default=str), time.time(), run_id),
+            )
+            return cur.rowcount == 1
+
+        return self._write(_op)
+
+    def record_run_outcome(
+        self,
+        run_id: str,
+        *,
+        actual_policy: Optional[dict[str, Any]] = None,
+        fallback_reason: Optional[str] = None,
+        usage: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        """Record the run's ACTUAL outcome: provider/model, fallback reason, usage.
+
+        Only touches actual_policy / fallback_reason / usage_json — never
+        requested_policy. Returns False for an unknown run (fail closed).
+        """
+
+        def _op(conn: sqlite3.Connection) -> bool:
+            cur = conn.execute(
+                "UPDATE runs SET actual_policy = ?, fallback_reason = ?, usage_json = ?,"
+                " updated_at = ? WHERE run_id = ?",
+                (
+                    json.dumps(actual_policy, ensure_ascii=False, default=str)
+                    if actual_policy is not None
+                    else None,
+                    fallback_reason,
+                    json.dumps(usage, ensure_ascii=False, default=str) if usage is not None else None,
+                    time.time(),
+                    run_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError(f"cannot record outcome for unknown run {run_id}")
+            return True
+
+        return self._write(_op)
+
     # -- row 1 state machine: guarded transitions + terminal immutability ----
 
     def transition(

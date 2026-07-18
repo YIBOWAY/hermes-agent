@@ -4729,6 +4729,40 @@ class APIServerAdapter(BasePlatformAdapter):
         head = f"id: {seq}\nevent: {event_type}\n" if seq is not None else f"event: {event_type}\n"
         return f"{head}data: {json.dumps(event)}\n\n".encode()
 
+    def _record_run_outcome(
+        self,
+        run_id: str,
+        *,
+        route: Optional[Dict[str, Any]],
+        fallback_model: Optional[str],
+        usage: Optional[Dict[str, Any]],
+    ) -> None:
+        """V2.6 (contract row 5): persist ACTUAL provider/model + usage + fallback.
+
+        Never touches requested_policy. Best-effort: storage failure must not
+        mask the run's terminal transition.
+        """
+        if not self._broker_enabled():
+            return
+        try:
+            actual_policy: Dict[str, Any] = {}
+            if route and route.get("model"):
+                actual_policy["model"] = route.get("model")
+            elif self._model_name:
+                actual_policy["model"] = self._model_name
+            if route and route.get("provider"):
+                actual_policy["provider"] = route.get("provider")
+            if fallback_model:
+                actual_policy["fallback_model"] = fallback_model
+            self._durable_store.record_run_outcome(
+                run_id,
+                actual_policy=actual_policy or None,
+                fallback_reason=None,
+                usage=usage,
+            )
+        except Exception:
+            logger.exception("[api_server] record_run_outcome failed for %s", run_id)
+
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
         def _push(event: Dict[str, Any]) -> None:
@@ -4978,9 +5012,32 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Per-client model routing for /v1/runs (see model_routes).
         route = self._resolve_route(body.get("model"))
+        # V2.6 (contract row 5): record the REQUESTED policy once at submission.
+        # The requested route is immutable — later actual-route recording never
+        # overwrites it. Never block a run on storage failure.
+        if self._broker_enabled():
+            try:
+                requested_policy: Dict[str, Any] = {}
+                if body.get("model") is not None:
+                    requested_policy["model"] = body.get("model")
+                if route:
+                    requested_policy["route"] = {
+                        k: v for k, v in route.items() if k not in {"api_key"}
+                    }
+                self._durable_store.set_requested_policy(run_id, requested_policy)
+            except Exception:
+                logger.exception("[api_server] set_requested_policy failed for %s", run_id)
         # Background task outlives the HTTP response (and thus the middleware
         # profile scope). Capture now and re-enter inside the task/executor.
         request_profile = _api_request_profile.get()
+        # Resolve the fallback chain once for evidence (V2.6); _create_agent
+        # re-resolves it for the agent itself. Best-effort.
+        try:
+            from gateway.run import GatewayRunner as _GR
+
+            fallback_model = _GR._load_fallback_model()
+        except Exception:
+            fallback_model = None
 
         async def _run_and_close():
             try:
@@ -5108,6 +5165,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         "timestamp": time.time(),
                         "error": error_msg,
                     })
+                    self._record_run_outcome(
+                        run_id, route=route, fallback_model=fallback_model, usage=usage
+                    )
                     self._set_run_status(
                         run_id,
                         "failed",
@@ -5123,6 +5183,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         "output": final_response,
                         "usage": usage,
                     })
+                    self._record_run_outcome(
+                        run_id, route=route, fallback_model=fallback_model, usage=usage
+                    )
                     self._set_run_status(
                         run_id,
                         "completed",
@@ -5131,6 +5194,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="run.completed",
                     )
             except asyncio.CancelledError:
+                self._record_run_outcome(
+                    run_id, route=route, fallback_model=fallback_model, usage=None
+                )
                 self._set_run_status(
                     run_id,
                     "cancelled",
@@ -5147,6 +5213,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 raise
             except Exception as exc:
                 logger.exception("[api_server] run %s failed", run_id)
+                self._record_run_outcome(
+                    run_id, route=route, fallback_model=fallback_model, usage=None
+                )
                 self._set_run_status(
                     run_id,
                     "failed",
@@ -5212,11 +5281,58 @@ class APIServerAdapter(BasePlatformAdapter):
         run_id = request.match_info["run_id"]
         status = self._run_statuses.get(run_id)
         if status is None:
+            # V2.6: fall back to the durable store so evidence survives restart.
+            if self._broker_enabled():
+                row = self._durable_store.get_run(run_id)
+                if row is not None:
+                    return web.json_response(self._run_status_from_store(row))
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
                 status=404,
             )
+        if self._broker_enabled():
+            # Merge durable evidence (requested/actual/usage/fallback) into the
+            # in-memory status without mutating the live dict.
+            row = self._durable_store.get_run(run_id)
+            if row is not None:
+                status = {**status, **self._evidence_from_row(row)}
         return web.json_response(status)
+
+    @staticmethod
+    def _evidence_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
+        """Project durable runs-row evidence columns onto the status response."""
+        out: Dict[str, Any] = {}
+        if row.get("requested_policy"):
+            try:
+                out["requested_policy"] = json.loads(row["requested_policy"])
+            except (TypeError, ValueError):
+                pass
+        if row.get("actual_policy"):
+            try:
+                out["actual_policy"] = json.loads(row["actual_policy"])
+            except (TypeError, ValueError):
+                pass
+        if row.get("fallback_reason") is not None:
+            out["fallback_reason"] = row["fallback_reason"]
+        if row.get("usage_json"):
+            try:
+                out["usage"] = json.loads(row["usage_json"])
+            except (TypeError, ValueError):
+                pass
+        return out
+
+    def _run_status_from_store(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        """Rebuild a pollable status dict from a durable runs row (post-restart)."""
+        status: Dict[str, Any] = {
+            "object": "hermes.run",
+            "run_id": row["run_id"],
+            "status": row.get("status"),
+            "session_id": row.get("session_id"),
+            "created_at": row.get("created_at"),
+            "updated_at": row.get("updated_at"),
+        }
+        status.update(self._evidence_from_row(row))
+        return status
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
         """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
