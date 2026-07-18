@@ -4848,10 +4848,32 @@ class APIServerAdapter(BasePlatformAdapter):
                 pass
 
     def _broker_is_terminal(self, run_id: str) -> bool:
+        """True when the run will never emit more live events.
+
+        Live map uses upstream names (completed/failed/cancelled). After a
+        process restart those entries are gone and only the durable store
+        remains, under contract names (succeeded/failed/stopped). SSE replay
+        must treat both as terminal so a post-restart subscriber gets the
+        backlog and an immediate stream-close instead of hanging on a live
+        fan-out that no longer exists.
+        """
         if run_id in self._run_event_terminal:
             return True
         status = self._run_statuses.get(run_id, {})
-        return status.get("status") in {"completed", "failed", "cancelled"}
+        if status.get("status") in {"completed", "failed", "cancelled"}:
+            return True
+        if self._broker_enabled() and getattr(self, "_durable_store", None) is not None:
+            try:
+                row = self._durable_store.get_run(run_id)
+            except Exception:
+                row = None
+            if row is not None and row.get("status") in {
+                "succeeded", "failed", "stopped",
+                # Tolerate upstream names if ever persisted raw.
+                "completed", "cancelled",
+            }:
+                return True
+        return False
 
     # Upstream run-status name -> contract RunState name (contract matrix §1).
     # waiting_for_approval / stopping are sub-states of running, never top-level.
