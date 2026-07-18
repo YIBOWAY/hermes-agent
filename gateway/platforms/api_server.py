@@ -91,8 +91,16 @@ from gateway.platforms.base import (
 )
 from agent.redact import redact_sensitive_text
 from gateway.readiness import collect_runtime_readiness
+from utils import is_truthy_value
+from gateway.durable_runs import DurableRunStore, canonical_digest
+from gateway.relay.descriptor import CONTRACT_VERSION as _RELAY_CONTRACT_VERSION
 
 logger = logging.getLogger(__name__)
+
+# Schema version advertised on ``GET /v1/capabilities`` when the durable
+# behavioral probe (V2.9) is active. Tracks the relay descriptor's additive-only
+# contract version so platform/upstream negotiate the same schema idiom.
+RELAY_CONTRACT_VERSION = _RELAY_CONTRACT_VERSION
 
 
 def _hermes_version() -> str:
@@ -914,6 +922,42 @@ except Exception:  # pragma: no cover - scanner is optional hardening
     _scan_cron_prompt = None
 
 
+def build_durable_store(
+    config: PlatformConfig, *, hermes_home: Optional[Any] = None
+) -> Optional[DurableRunStore]:
+    """Construct the DurableRunAuthority store when enabled, else ``None``.
+
+    V2.13: the reviewed durable-run semantics (V2.2–V2.9) are dormant unless a
+    store is passed to ``APIServerAdapter`` (``_broker_enabled()`` is simply
+    ``store is not None``). This is the single, unit-testable construction
+    point ``gateway/run.py`` uses, and it is **opt-in / default-OFF** so the
+    legacy in-memory ``/v1/runs`` behavior stays byte-identical unless enabled.
+
+    Enable via ``platforms.api_server.extra.durable_runs_enabled`` (an explicit
+    value wins over the env var) or the ``API_SERVER_DURABLE_RUNS`` env var.
+    The SQLite DB lives at ``<hermes_home>/durable_runs.db`` so each
+    profile/instance (``HERMES_HOME``) gets its own store; override with
+    ``extra.durable_runs_db`` or the ``API_SERVER_DURABLE_RUNS_DB`` env var.
+    When disabled this is side-effect-free — no store is constructed and no DB
+    file is created.
+    """
+    extra = config.extra or {}
+    enabled_raw = extra.get("durable_runs_enabled")
+    if enabled_raw is None:
+        enabled_raw = os.getenv("API_SERVER_DURABLE_RUNS")
+    if not is_truthy_value(enabled_raw, default=False):
+        return None
+    db_path = extra.get("durable_runs_db") or os.getenv("API_SERVER_DURABLE_RUNS_DB")
+    if not db_path:
+        home = hermes_home
+        if home is None:
+            from hermes_cli.config import get_hermes_home
+
+            home = get_hermes_home()
+        db_path = str(Path(home) / "durable_runs.db")
+    return DurableRunStore(db_path=str(db_path))
+
+
 class APIServerAdapter(BasePlatformAdapter):
     """
     OpenAI-compatible HTTP API server adapter.
@@ -937,9 +981,13 @@ class APIServerAdapter(BasePlatformAdapter):
     # should complete the interrupted work rather than acknowledge (#57056).
     interactive_resume: bool = False
 
-    def __init__(self, config: PlatformConfig):
+    def __init__(self, config: PlatformConfig, durable_store: Optional[Any] = None):
         super().__init__(config, Platform.API_SERVER)
         extra = config.extra or {}
+        # Optional DurableRunAuthority store (gateway.durable_runs.DurableRunStore).
+        # When None, /v1/runs keeps its legacy in-memory-only behavior; when set,
+        # POST /v1/runs honors Idempotency-Key via durable submit-or-get (V2.2).
+        self._durable_store = durable_store
         self._host: str = extra.get("host", os.getenv("API_SERVER_HOST", DEFAULT_HOST))
         raw_port = extra.get("port")
         if raw_port is None:
@@ -989,6 +1037,13 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        # V2.5 durable event-plane broker (only active when a durable_store is
+        # configured).  Per run: monotonically increasing seq, per-subscriber
+        # fan-out queues, and a terminal flag.  Canonical events live in the
+        # durable store; these structures are transport only.
+        self._run_event_seq: Dict[str, int] = {}
+        self._run_event_subscribers: Dict[str, list] = {}
+        self._run_event_terminal: set[str] = set()
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         # Concurrency cap shared across all agent-serving endpoints
         # (/v1/chat/completions, /v1/responses, /v1/runs). Read from
@@ -1535,6 +1590,12 @@ class APIServerAdapter(BasePlatformAdapter):
     # that the sanitized form is safe to pass into Honcho / state.db.
     _MAX_SESSION_HEADER_LEN = 256
 
+    # Soft length cap for the Idempotency-Key header.  Bounded in aggregate by
+    # aiohttp, but capped tighter here so a caller can't burn memory / bloat the
+    # durable store's primary key with a multi-kilobyte "key".  256 chars is far
+    # above any realistic idempotency token (a UUID is 36).
+    _MAX_IDEMPOTENCY_KEY_LEN = 256
+
     def _parse_session_key_header(
         self, request: "web.Request"
     ) -> tuple[Optional[str], Optional["web.Response"]]:
@@ -1959,7 +2020,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
-        return web.json_response({
+        payload = {
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
             "model": self._model_name,
@@ -2026,7 +2087,91 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
             },
-        })
+        }
+
+        # V2.9 (contract row 8): additive behavioral probe. Only when a durable
+        # store is configured do we additively surface a contract_version and a
+        # `durable` block whose per-capability `grounded` is backed by a
+        # side-effect-free read-only store probe — never a bare "configured"
+        # flag, and never a mutating write. Legacy (no-store) payload above is
+        # byte-identical to before.
+        if self._broker_enabled():
+            payload["contract_version"] = RELAY_CONTRACT_VERSION
+            payload["durable"] = self._capability_probes()
+
+        return web.json_response(payload)
+
+    # Bogus ids used only for read-only schema/connectivity probes. Real run
+    # ids are ``run_<32 hex>`` (see ``_handle_runs``), so this prefix can never
+    # collide with a real row — the probe must return "no row / empty", which
+    # is exactly what proves the table is present and readable.
+    _PROBE_RUN_ID = "run_capprobe_deadbeef"
+    _PROBE_CHALLENGE_ID = "ch_capprobe_deadbeef"
+
+    def _capability_probes(self) -> Dict[str, Dict[str, Any]]:
+        """Behavioral capability probe for ``GET /v1/capabilities`` (V2.9).
+
+        Each durable capability is reported as ``{supported, grounded,
+        evidence}``:
+
+        * ``supported`` — the code path exists (a durable store is configured).
+        * ``grounded`` — a *read-only, side-effect-free* store probe succeeded,
+          proving the underlying table is present and answers. We deliberately
+          never probe with a mutating write (``submit_or_get`` / ``append_event``
+          / ``consume_approval``): advertising a capability must not change
+          state. The single genuine live round-trip is ``replay_events`` (a
+          pure ``SELECT``); the rest are schema/connectivity reads against a
+          bogus id that must return "no row / empty".
+        * ``evidence`` — names the grounding signal (which probe), so a caller
+          can see *why* the capability is believed.
+
+        Fail-closed: any probe that raises degrades that capability to
+        ``grounded=False`` rather than claiming support on a stale flag.
+        """
+        store = self._durable_store
+
+        def _probe(evidence: str, read) -> Dict[str, Any]:
+            try:
+                read()
+            except Exception:  # fail-closed: a broken store is not grounded
+                logger.debug("capability probe failed for %s", evidence, exc_info=True)
+                return {"supported": True, "grounded": False, "evidence": evidence}
+            return {"supported": True, "grounded": True, "evidence": evidence}
+
+        return {
+            # Idempotency: grounded by the runs table answering a read (the
+            # write path submit_or_get is never exercised as a probe).
+            "idempotency": _probe(
+                "store.get_run",
+                lambda: store.get_run(self._PROBE_RUN_ID),
+            ),
+            # Event replay: the only true side-effect-free round-trip — a pure
+            # SELECT over run_events.
+            "event_replay": _probe(
+                "store.replay_events",
+                lambda: store.replay_events(self._PROBE_RUN_ID, since_seq=0),
+            ),
+            # Approval CAS: grounded by the approval_grants table answering a
+            # read; consume_approval (mutating CAS) is never used as a probe.
+            "approval_cas": _probe(
+                "store.get_approval_challenge",
+                lambda: store.get_approval_challenge(self._PROBE_CHALLENGE_ID),
+            ),
+            # Idempotent stop + restart reconcile + run status all read runs.
+            "idempotent_stop": _probe(
+                "store.get_run",
+                lambda: store.get_run(self._PROBE_RUN_ID),
+            ),
+            "restart_reconcile": _probe(
+                "store.list_non_terminal_runs",
+                lambda: store.list_non_terminal_runs(),
+            ),
+            # requested/actual evidence lives in the runs row's evidence cols.
+            "run_evidence": _probe(
+                "store.get_run",
+                lambda: store.get_run(self._PROBE_RUN_ID),
+            ),
+        }
 
     async def _handle_skills(self, request: "web.Request") -> "web.Response":
         """GET /v1/skills — list installed skills visible to the API-server agent.
@@ -4611,6 +4756,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
+    _APPROVAL_CHALLENGE_TTL = 300  # seconds an approval challenge stays consumable
 
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
@@ -4625,7 +4771,187 @@ class APIServerAdapter(BasePlatformAdapter):
         current.setdefault("created_at", fields.pop("created_at", now))
         current.update(fields)
         self._run_statuses[run_id] = current
+        # V2.8: mirror the live status into the durable store (no-op unless the
+        # broker is configured). Keeps runs.status consistent for stop/reconcile.
+        self._sync_durable_status(run_id, status)
         return current
+
+    # ------------------------------------------------------------------
+    # /v1/runs — V2.5 durable event-plane broker (contract matrix §2 row 4)
+    # ------------------------------------------------------------------
+    #
+    # These helpers are active only when a durable_store is configured. They
+    # give each run event a stable event_id + per-run monotonic seq, persist it
+    # to the store (so it survives restart and SSE disconnect), and fan it out
+    # to every subscriber's own queue (so concurrent subscribers don't race a
+    # single shared queue). The legacy single-queue path is used when no store
+    # is configured.
+
+    def _broker_enabled(self) -> bool:
+        return self._durable_store is not None
+
+    def _broker_seed(self, run_id: str) -> None:
+        """Initialise broker state for a new run (idempotent)."""
+        self._run_event_seq.setdefault(run_id, 0)
+        self._run_event_subscribers.setdefault(run_id, [])
+
+    def _broker_publish(self, run_id: str, event: Optional[Dict[str, Any]]) -> None:
+        """Persist + fan out one event; ``None`` closes every subscriber queue.
+
+        Thread-safe: producers call this from the executor thread via
+        ``loop.call_soon_threadsafe``, so it always runs on the event loop.
+        """
+        if event is None:
+            self._run_event_terminal.add(run_id)
+            for q in list(self._run_event_subscribers.get(run_id, [])):
+                try:
+                    q.put_nowait(None)
+                except Exception:
+                    pass
+            return
+        self._broker_seed(run_id)
+        seq = self._run_event_seq[run_id] + 1
+        self._run_event_seq[run_id] = seq
+        event_type = str(event.get("event", "event"))
+        # Persist first: the store assigns the canonical event_id and the
+        # authoritative per-run seq. Fall back to the in-memory seq if the
+        # store is unreachable so live delivery is never blocked by storage.
+        try:
+            rec = self._durable_store.append_event(run_id, event_type, dict(event))
+            seq = rec.seq
+            event_id = rec.event_id
+        except Exception:
+            logger.exception("[api_server] durable append_event failed for run %s", run_id)
+            event_id = f"evt_{uuid.uuid4().hex}"
+        enriched = dict(event)
+        enriched["seq"] = seq
+        enriched["event_id"] = event_id
+        for q in list(self._run_event_subscribers.get(run_id, [])):
+            try:
+                q.put_nowait(enriched)
+            except Exception:
+                pass
+
+    def _broker_subscribe(self, run_id: str) -> "asyncio.Queue":
+        """Attach a new subscriber queue for a live run."""
+        self._broker_seed(run_id)
+        q: "asyncio.Queue" = asyncio.Queue()
+        self._run_event_subscribers[run_id].append(q)
+        return q
+
+    def _broker_unsubscribe(self, run_id: str, q: "asyncio.Queue") -> None:
+        subs = self._run_event_subscribers.get(run_id)
+        if subs is not None:
+            try:
+                subs.remove(q)
+            except ValueError:
+                pass
+
+    def _broker_is_terminal(self, run_id: str) -> bool:
+        if run_id in self._run_event_terminal:
+            return True
+        status = self._run_statuses.get(run_id, {})
+        return status.get("status") in {"completed", "failed", "cancelled"}
+
+    # Upstream run-status name -> contract RunState name (contract matrix §1).
+    # waiting_for_approval / stopping are sub-states of running, never top-level.
+    _STATUS_TO_RUNSTATE = {
+        "queued": "queued",
+        "running": "running",
+        "waiting_for_approval": "running",
+        "stopping": "running",
+        "completed": "succeeded",
+        "failed": "failed",
+        "cancelled": "stopped",
+    }
+
+    def _sync_durable_status(self, run_id: str, upstream_status: str) -> None:
+        """V2.8 (contract row 7): mirror the live status into the durable store.
+
+        Maps the upstream status name to the contract RunState and applies it via
+        a guarded transition. Best-effort: an illegal/terminal transition returns
+        False (terminal immutability) and storage failure never breaks the run.
+        """
+        if not self._broker_enabled():
+            return
+        contract = self._STATUS_TO_RUNSTATE.get(upstream_status)
+        if contract is None:
+            return
+        try:
+            from gateway.durable_runs import RunState
+
+            self._durable_store.transition(run_id, RunState(contract))
+        except Exception:
+            logger.exception("[api_server] durable status sync failed for %s", run_id)
+
+    def reconcile_durable_runs(self) -> int:
+        """V2.8 (contract row 7): reconcile phantom in-flight runs on startup.
+
+        After a restart, runs left in queued/running in the store have no live
+        task — they are phantom-running. Reconcile them to the deterministic
+        terminal state ``stopped``. Idempotent and terminal-safe (terminal runs
+        are never rewritten). Returns the number of runs reconciled.
+        """
+        if not self._broker_enabled():
+            return 0
+        try:
+            from gateway.durable_runs import RunState
+
+            reconciled = 0
+            for row in self._durable_store.list_non_terminal_runs():
+                if self._durable_store.transition(row["run_id"], RunState.STOPPED):
+                    reconciled += 1
+            if reconciled:
+                logger.info(
+                    "[api_server] reconciled %d phantom run(s) to stopped on startup",
+                    reconciled,
+                )
+            return reconciled
+        except Exception:
+            logger.exception("[api_server] reconcile_durable_runs failed")
+            return 0
+
+    @staticmethod
+    def _sse_frame(event: Dict[str, Any]) -> bytes:
+        """One spec-compliant SSE frame: id + event + data."""
+        seq = event.get("seq")
+        event_type = event.get("event", "message")
+        head = f"id: {seq}\nevent: {event_type}\n" if seq is not None else f"event: {event_type}\n"
+        return f"{head}data: {json.dumps(event)}\n\n".encode()
+
+    def _record_run_outcome(
+        self,
+        run_id: str,
+        *,
+        route: Optional[Dict[str, Any]],
+        fallback_model: Optional[str],
+        usage: Optional[Dict[str, Any]],
+    ) -> None:
+        """V2.6 (contract row 5): persist ACTUAL provider/model + usage + fallback.
+
+        Never touches requested_policy. Best-effort: storage failure must not
+        mask the run's terminal transition.
+        """
+        if not self._broker_enabled():
+            return
+        try:
+            actual_policy: Dict[str, Any] = {}
+            if route and route.get("model"):
+                actual_policy["model"] = route.get("model")
+            elif self._model_name:
+                actual_policy["model"] = self._model_name
+            if route and route.get("provider"):
+                actual_policy["provider"] = route.get("provider")
+            if fallback_model:
+                actual_policy["fallback_model"] = fallback_model
+            self._durable_store.record_run_outcome(
+                run_id,
+                actual_policy=actual_policy or None,
+                fallback_reason=None,
+                usage=usage,
+            )
+        except Exception:
+            logger.exception("[api_server] record_run_outcome failed for %s", run_id)
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
@@ -4635,6 +4961,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._run_statuses.get(run_id, {}).get("status", "running"),
                 last_event=event.get("event"),
             )
+            if self._broker_enabled():
+                try:
+                    loop.call_soon_threadsafe(self._broker_publish, run_id, event)
+                except Exception:
+                    pass
+                return
             q = self._run_streams.get(run_id)
             if q is None:
                 return
@@ -4747,8 +5079,76 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
-        run_id = f"run_{uuid.uuid4().hex}"
-        session_id = body.get("session_id") or stored_session_id or run_id
+        # V2.2 (contract matrix §2 rows 1/2): honor the caller's Idempotency-Key
+        # with a durable submit-or-get against the canonical request digest.
+        # Same identity (key + same semantic body) ⇒ recover the SAME Run without
+        # re-executing; same key with a different digest ⇒ 409 (fail closed). When
+        # no key is supplied, or no durable store is configured, behavior is
+        # unchanged (a fresh run is minted below).
+        idempotency_key = request.headers.get("Idempotency-Key") or None
+        if idempotency_key is not None:
+            idempotency_key = idempotency_key.strip() or None
+        if idempotency_key is not None and len(idempotency_key) > self._MAX_IDEMPOTENCY_KEY_LEN:
+            return web.json_response(
+                _openai_error(
+                    "Idempotency-Key exceeds maximum length",
+                    code="idempotency_key_too_long",
+                ),
+                status=400,
+            )
+        if idempotency_key is not None and self._durable_store is not None:
+            from gateway.durable_runs import ConflictError
+
+            try:
+                submit = self._durable_store.submit_or_get(
+                    idempotency_key=idempotency_key,
+                    request_body=body,
+                )
+            except ConflictError:
+                return web.json_response(
+                    _openai_error(
+                        "Idempotency-Key was already used with a different request",
+                        code="idempotency_conflict",
+                    ),
+                    status=409,
+                )
+            if not submit.created:
+                # Recovery: return the existing Run; never re-spawn it.
+                response_headers = (
+                    {"X-Hermes-Session-Key": gateway_session_key}
+                    if gateway_session_key
+                    else {}
+                )
+                return web.json_response(
+                    {
+                        "run_id": submit.run_id,
+                        "status": "recovered",
+                        "idempotent_replay": True,
+                        "idempotency_key": idempotency_key,
+                    },
+                    status=202,
+                    headers=response_headers,
+                )
+            run_id = submit.run_id
+            session_id = body.get("session_id") or stored_session_id or run_id
+        else:
+            run_id = f"run_{uuid.uuid4().hex}"
+            session_id = body.get("session_id") or stored_session_id or run_id
+        # Ensure a durable run row exists whenever the broker is active so
+        # events/approvals have a parent (contract row 9). Keyed submissions were
+        # already persisted by submit_or_get; this registers server-minted runs.
+        # Never block a run on storage failure.
+        if self._broker_enabled():
+            try:
+                self._durable_store.register_run(
+                    run_id=run_id,
+                    session_id=session_id,
+                    idempotency_key=idempotency_key,
+                    request_body=body,
+                )
+                self._broker_seed(run_id)
+            except Exception:
+                logger.exception("[api_server] durable register_run failed for %s", run_id)
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
         # conversation/memory scopes, not authorization namespaces: multiple
@@ -4767,6 +5167,12 @@ class APIServerAdapter(BasePlatformAdapter):
 
         def _put_event_if_active(event: Optional[Dict]) -> None:
             """Enqueue only while this run still owns live transport state."""
+            if self._broker_enabled():
+                # Broker path: publish is the single funnel for every event and
+                # the close sentinel. Guard against post-close stragglers.
+                if event is None or self._run_streams.get(run_id) is q:
+                    self._broker_publish(run_id, event)
+                return
             if self._run_streams.get(run_id) is q:
                 q.put_nowait(event)
 
@@ -4796,9 +5202,32 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Per-client model routing for /v1/runs (see model_routes).
         route = self._resolve_route(body.get("model"))
+        # V2.6 (contract row 5): record the REQUESTED policy once at submission.
+        # The requested route is immutable — later actual-route recording never
+        # overwrites it. Never block a run on storage failure.
+        if self._broker_enabled():
+            try:
+                requested_policy: Dict[str, Any] = {}
+                if body.get("model") is not None:
+                    requested_policy["model"] = body.get("model")
+                if route:
+                    requested_policy["route"] = {
+                        k: v for k, v in route.items() if k not in {"api_key"}
+                    }
+                self._durable_store.set_requested_policy(run_id, requested_policy)
+            except Exception:
+                logger.exception("[api_server] set_requested_policy failed for %s", run_id)
         # Background task outlives the HTTP response (and thus the middleware
         # profile scope). Capture now and re-enter inside the task/executor.
         request_profile = _api_request_profile.get()
+        # Resolve the fallback chain once for evidence (V2.6); _create_agent
+        # re-resolves it for the agent itself. Best-effort.
+        try:
+            from gateway.run import GatewayRunner as _GR
+
+            fallback_model = _GR._load_fallback_model()
+        except Exception:
+            fallback_model = None
 
         async def _run_and_close():
             try:
@@ -4836,6 +5265,29 @@ class APIServerAdapter(BasePlatformAdapter):
                         from gateway.run import _redact_approval_command
 
                         event["command"] = _redact_approval_command(event.get("command"))
+                    # V2.7 (contract row 6): issue an exact durable challenge bound
+                    # to this run + a canonical digest of the gated action. The
+                    # client must echo challenge_id + action_digest back to consume
+                    # (single-use + TTL + CAS). Broker-only; legacy path unchanged.
+                    if self._broker_enabled():
+                        action_digest = canonical_digest({
+                            "command": event.get("command"),
+                            "description": event.get("description"),
+                            "pattern_keys": event.get("pattern_keys"),
+                        })
+                        try:
+                            ch = self._durable_store.issue_approval_challenge(
+                                run_id,
+                                action_digest=action_digest,
+                                ttl_seconds=self._APPROVAL_CHALLENGE_TTL,
+                            )
+                            event["challenge_id"] = ch.challenge_id
+                            event["action_digest"] = action_digest
+                            event["expires_at"] = ch.expires_at
+                        except Exception:
+                            logger.exception(
+                                "[api_server] issue_approval_challenge failed for %s", run_id
+                            )
                     event.update({
                         "event": "approval.request",
                         "run_id": run_id,
@@ -4851,7 +5303,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="approval.request",
                     )
                     try:
-                        loop.call_soon_threadsafe(q.put_nowait, event)
+                        if self._broker_enabled():
+                            loop.call_soon_threadsafe(self._broker_publish, run_id, event)
+                        else:
+                            loop.call_soon_threadsafe(q.put_nowait, event)
                     except Exception:
                         pass
 
@@ -4926,6 +5381,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         "timestamp": time.time(),
                         "error": error_msg,
                     })
+                    self._record_run_outcome(
+                        run_id, route=route, fallback_model=fallback_model, usage=usage
+                    )
                     self._set_run_status(
                         run_id,
                         "failed",
@@ -4941,6 +5399,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         "output": final_response,
                         "usage": usage,
                     })
+                    self._record_run_outcome(
+                        run_id, route=route, fallback_model=fallback_model, usage=usage
+                    )
                     self._set_run_status(
                         run_id,
                         "completed",
@@ -4949,6 +5410,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="run.completed",
                     )
             except asyncio.CancelledError:
+                self._record_run_outcome(
+                    run_id, route=route, fallback_model=fallback_model, usage=None
+                )
                 self._set_run_status(
                     run_id,
                     "cancelled",
@@ -4965,6 +5429,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 raise
             except Exception as exc:
                 logger.exception("[api_server] run %s failed", run_id)
+                self._record_run_outcome(
+                    run_id, route=route, fallback_model=fallback_model, usage=None
+                )
                 self._set_run_status(
                     run_id,
                     "failed",
@@ -5030,11 +5497,58 @@ class APIServerAdapter(BasePlatformAdapter):
         run_id = request.match_info["run_id"]
         status = self._run_statuses.get(run_id)
         if status is None:
+            # V2.6: fall back to the durable store so evidence survives restart.
+            if self._broker_enabled():
+                row = self._durable_store.get_run(run_id)
+                if row is not None:
+                    return web.json_response(self._run_status_from_store(row))
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
                 status=404,
             )
+        if self._broker_enabled():
+            # Merge durable evidence (requested/actual/usage/fallback) into the
+            # in-memory status without mutating the live dict.
+            row = self._durable_store.get_run(run_id)
+            if row is not None:
+                status = {**status, **self._evidence_from_row(row)}
         return web.json_response(status)
+
+    @staticmethod
+    def _evidence_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
+        """Project durable runs-row evidence columns onto the status response."""
+        out: Dict[str, Any] = {}
+        if row.get("requested_policy"):
+            try:
+                out["requested_policy"] = json.loads(row["requested_policy"])
+            except (TypeError, ValueError):
+                pass
+        if row.get("actual_policy"):
+            try:
+                out["actual_policy"] = json.loads(row["actual_policy"])
+            except (TypeError, ValueError):
+                pass
+        if row.get("fallback_reason") is not None:
+            out["fallback_reason"] = row["fallback_reason"]
+        if row.get("usage_json"):
+            try:
+                out["usage"] = json.loads(row["usage_json"])
+            except (TypeError, ValueError):
+                pass
+        return out
+
+    def _run_status_from_store(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        """Rebuild a pollable status dict from a durable runs row (post-restart)."""
+        status: Dict[str, Any] = {
+            "object": "hermes.run",
+            "run_id": row["run_id"],
+            "status": row.get("status"),
+            "session_id": row.get("session_id"),
+            "created_at": row.get("created_at"),
+            "updated_at": row.get("updated_at"),
+        }
+        status.update(self._evidence_from_row(row))
+        return status
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
         """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
@@ -5043,6 +5557,9 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
+
+        if self._broker_enabled():
+            return await self._handle_run_events_durable(request, run_id)
 
         # Allow subscribing slightly before the run is registered (race condition window)
         for _ in range(20):
@@ -5087,6 +5604,114 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return response
 
+    async def _handle_run_events_durable(
+        self, request: "web.Request", run_id: str
+    ) -> "web.StreamResponse":
+        """Durable, cursor-resumable SSE for runs (contract matrix §2 row 4).
+
+        Canonical events live in the durable store, so SSE disconnect never
+        deletes them and a fresh cursor (``?since={seq}`` or ``Last-Event-ID``)
+        replays with no gap/dup. Each subscriber gets its own fan-out queue, so
+        concurrent subscribers don't race one shared queue.
+        """
+        # Resolve the resume cursor BEFORE prepare() (headers/status are fixed
+        # after). Last-Event-ID takes precedence over the ?since= query param.
+        cursor = 0
+        raw_cursor = request.headers.get("Last-Event-ID") or request.query.get("since")
+        if raw_cursor:
+            try:
+                cursor = max(0, int(str(raw_cursor).strip()))
+            except (TypeError, ValueError):
+                return web.json_response(
+                    _openai_error("Invalid resume cursor", code="invalid_cursor"),
+                    status=400,
+                )
+
+        terminal = self._broker_is_terminal(run_id)
+        known = (
+            terminal
+            or run_id in self._run_event_subscribers
+            or run_id in self._run_streams
+            or run_id in self._run_statuses
+            or (self._durable_store.get_run(run_id) is not None)
+        )
+        if not known:
+            # Allow subscribing slightly before the run is registered (race window).
+            for _ in range(20):
+                if run_id in self._run_statuses or self._durable_store.get_run(run_id):
+                    known = True
+                    break
+                await asyncio.sleep(0.05)
+            if not known:
+                return web.json_response(
+                    _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                    status=404,
+                )
+
+        # Durable backlog strictly after the cursor (no gap, no dup).
+        try:
+            backlog = self._durable_store.replay_events(run_id, since_seq=cursor)
+        except Exception:
+            logger.exception("[api_server] durable replay failed for run %s", run_id)
+            backlog = []
+
+        live_q = None
+        if not terminal:
+            live_q = self._broker_subscribe(run_id)
+            self._run_stream_subscribers.add(run_id)
+
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+        await response.prepare(request)
+
+        try:
+            # 1) Replay the durable backlog (spec-compliant frames with id:/event:).
+            last_sent = cursor
+            for rec in backlog:
+                if rec.seq <= last_sent:
+                    continue  # belt-and-suspenders: no duplicate across the seam
+                frame = {"seq": rec.seq, "event": rec.event_type, **rec.payload}
+                await response.write(self._sse_frame(frame))
+                last_sent = rec.seq
+
+            # 2) Bridge to live fan-out for a still-running run.
+            if live_q is not None:
+                while True:
+                    try:
+                        event = await asyncio.wait_for(live_q.get(), timeout=30.0)
+                    except asyncio.TimeoutError:
+                        if self._broker_is_terminal(run_id):
+                            await response.write(b": stream closed\n\n")
+                            break
+                        await response.write(b": keepalive\n\n")
+                        continue
+                    if event is None:
+                        await response.write(b": stream closed\n\n")
+                        break
+                    ev_seq = event.get("seq")
+                    if ev_seq is not None and ev_seq <= last_sent:
+                        continue  # already replayed from the durable backlog
+                    await response.write(self._sse_frame(event))
+                    if ev_seq is not None:
+                        last_sent = ev_seq
+            else:
+                # Terminal run: backlog fully replayed, close immediately.
+                await response.write(b": stream closed\n\n")
+        except Exception as exc:
+            logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
+        finally:
+            if live_q is not None:
+                self._broker_unsubscribe(run_id, live_q)
+            self._run_stream_subscribers.discard(run_id)
+
+        return response
+
 
     async def _handle_run_approval(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/approval — resolve a pending run approval."""
@@ -5119,6 +5744,45 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 status=400,
             )
+
+        # V2.7 (contract row 6): when a durable store is configured, an approval
+        # response must present the exact challenge (challenge_id + matching
+        # action_digest) and consume it — single-use + TTL + compare-and-swap.
+        # A stale / expired / digest-mismatched / replayed / cross-run grant is
+        # rejected with 409 and NEVER resolves the queue; a failed consume leaves
+        # the real grant intact. Legacy path (no store) is unchanged below.
+        if self._broker_enabled():
+            challenge_id = body.get("challenge_id")
+            action_digest = body.get("action_digest")
+            if not challenge_id or not action_digest:
+                return web.json_response(
+                    _openai_error(
+                        "Approval requires challenge_id and action_digest",
+                        code="approval_challenge_required",
+                    ),
+                    status=409,
+                )
+            grant = self._durable_store.get_approval_challenge(str(challenge_id))
+            if grant is None or grant.get("run_id") != run_id:
+                # Unknown challenge, or one issued for a different run.
+                return web.json_response(
+                    _openai_error(
+                        "Approval challenge is invalid for this run",
+                        code="approval_challenge_invalid",
+                    ),
+                    status=409,
+                )
+            consumed = self._durable_store.consume_approval(
+                str(challenge_id), action_digest=str(action_digest)
+            )
+            if not consumed:
+                return web.json_response(
+                    _openai_error(
+                        "Approval challenge is stale, expired, already used, or mismatched",
+                        code="approval_challenge_invalid",
+                    ),
+                    status=409,
+                )
 
         approval_session_key = self._run_approval_sessions.get(run_id)
         if not approval_session_key:
@@ -5156,18 +5820,27 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         self._set_run_status(run_id, "running", last_event="approval.responded")
-        q = self._run_streams.get(run_id)
-        if q is not None:
-            try:
-                q.put_nowait({
-                    "event": "approval.responded",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "choice": choice,
-                    "resolved": resolved,
-                })
-            except Exception:
-                pass
+        if self._broker_enabled():
+            self._broker_publish(run_id, {
+                "event": "approval.responded",
+                "run_id": run_id,
+                "timestamp": time.time(),
+                "choice": choice,
+                "resolved": resolved,
+            })
+        else:
+            q = self._run_streams.get(run_id)
+            if q is not None:
+                try:
+                    q.put_nowait({
+                        "event": "approval.responded",
+                        "run_id": run_id,
+                        "timestamp": time.time(),
+                        "choice": choice,
+                        "resolved": resolved,
+                    })
+                except Exception:
+                    pass
 
         return web.json_response({
             "object": "hermes.run.approval_response",
@@ -5177,7 +5850,14 @@ class APIServerAdapter(BasePlatformAdapter):
         })
 
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
-        """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
+        """POST /v1/runs/{run_id}/stop — interrupt a running agent.
+
+        V2.8 (contract row 7): stop is idempotent when a durable store is
+        configured. Repeating stop on a known terminal run returns the SAME
+        result (200), never a 404 — the durable store is the authority on
+        terminal state, so a cleaned-up live ref does not make a finished run
+        unaddressable. A run that never existed still 404s.
+        """
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
@@ -5187,6 +5867,14 @@ class APIServerAdapter(BasePlatformAdapter):
         task = self._active_run_tasks.get(run_id)
 
         if agent is None and task is None:
+            # No live ref. If the store knows this run and it is terminal, stop
+            # is an idempotent no-op returning the same result; otherwise 404.
+            if self._broker_enabled():
+                row = self._durable_store.get_run(run_id)
+                if row is not None:
+                    return web.json_response(
+                        {"run_id": run_id, "status": "stopped", "idempotent_replay": True}
+                    )
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
 
         self._set_run_status(run_id, "stopping", last_event="run.stopping")
@@ -5314,6 +6002,10 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app["api_server_adapter"] = self
             if self.gateway_runner is not None:
                 self._app["gateway_runner"] = self.gateway_runner
+
+            # V2.8: reconcile phantom in-flight runs to a deterministic terminal
+            # state (stopped) before serving. No-op unless a durable store is set.
+            self.reconcile_durable_runs()
 
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())

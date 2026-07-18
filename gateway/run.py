@@ -9108,11 +9108,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return WeixinAdapter(config)
 
         elif platform == Platform.API_SERVER:
-            from gateway.platforms.api_server import APIServerAdapter, check_api_server_requirements
+            from gateway.platforms.api_server import (
+                APIServerAdapter,
+                build_durable_store,
+                check_api_server_requirements,
+            )
             if not check_api_server_requirements():
                 logger.warning("API Server: aiohttp not installed")
                 return None
-            adapter = APIServerAdapter(config)
+            # V2.13: opt-in durable-run store. Default (disabled) -> None, so
+            # /v1/runs keeps its legacy in-memory behavior byte-identical.
+            adapter = APIServerAdapter(config, durable_store=build_durable_store(config))
             adapter.gateway_runner = self
             return adapter
 
