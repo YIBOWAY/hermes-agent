@@ -268,6 +268,15 @@ class DurableRunStore:
             ).fetchone()
         return dict(row) if row is not None else None
 
+    def list_non_terminal_runs(self) -> list[dict[str, Any]]:
+        """All runs in a non-terminal state (queued/running) — for reconcile."""
+        non_terminal = (RunState.QUEUED.value, RunState.RUNNING.value)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM runs WHERE status IN (?, ?)", non_terminal
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def register_run(
         self,
         *,

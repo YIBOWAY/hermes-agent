@@ -4644,6 +4644,9 @@ class APIServerAdapter(BasePlatformAdapter):
         current.setdefault("created_at", fields.pop("created_at", now))
         current.update(fields)
         self._run_statuses[run_id] = current
+        # V2.8: mirror the live status into the durable store (no-op unless the
+        # broker is configured). Keeps runs.status consistent for stop/reconcile.
+        self._sync_durable_status(run_id, status)
         return current
 
     # ------------------------------------------------------------------
@@ -4722,6 +4725,64 @@ class APIServerAdapter(BasePlatformAdapter):
             return True
         status = self._run_statuses.get(run_id, {})
         return status.get("status") in {"completed", "failed", "cancelled"}
+
+    # Upstream run-status name -> contract RunState name (contract matrix §1).
+    # waiting_for_approval / stopping are sub-states of running, never top-level.
+    _STATUS_TO_RUNSTATE = {
+        "queued": "queued",
+        "running": "running",
+        "waiting_for_approval": "running",
+        "stopping": "running",
+        "completed": "succeeded",
+        "failed": "failed",
+        "cancelled": "stopped",
+    }
+
+    def _sync_durable_status(self, run_id: str, upstream_status: str) -> None:
+        """V2.8 (contract row 7): mirror the live status into the durable store.
+
+        Maps the upstream status name to the contract RunState and applies it via
+        a guarded transition. Best-effort: an illegal/terminal transition returns
+        False (terminal immutability) and storage failure never breaks the run.
+        """
+        if not self._broker_enabled():
+            return
+        contract = self._STATUS_TO_RUNSTATE.get(upstream_status)
+        if contract is None:
+            return
+        try:
+            from gateway.durable_runs import RunState
+
+            self._durable_store.transition(run_id, RunState(contract))
+        except Exception:
+            logger.exception("[api_server] durable status sync failed for %s", run_id)
+
+    def reconcile_durable_runs(self) -> int:
+        """V2.8 (contract row 7): reconcile phantom in-flight runs on startup.
+
+        After a restart, runs left in queued/running in the store have no live
+        task — they are phantom-running. Reconcile them to the deterministic
+        terminal state ``stopped``. Idempotent and terminal-safe (terminal runs
+        are never rewritten). Returns the number of runs reconciled.
+        """
+        if not self._broker_enabled():
+            return 0
+        try:
+            from gateway.durable_runs import RunState
+
+            reconciled = 0
+            for row in self._durable_store.list_non_terminal_runs():
+                if self._durable_store.transition(row["run_id"], RunState.STOPPED):
+                    reconciled += 1
+            if reconciled:
+                logger.info(
+                    "[api_server] reconciled %d phantom run(s) to stopped on startup",
+                    reconciled,
+                )
+            return reconciled
+        except Exception:
+            logger.exception("[api_server] reconcile_durable_runs failed")
+            return 0
 
     @staticmethod
     def _sse_frame(event: Dict[str, Any]) -> bytes:
@@ -5662,7 +5723,14 @@ class APIServerAdapter(BasePlatformAdapter):
         })
 
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
-        """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
+        """POST /v1/runs/{run_id}/stop — interrupt a running agent.
+
+        V2.8 (contract row 7): stop is idempotent when a durable store is
+        configured. Repeating stop on a known terminal run returns the SAME
+        result (200), never a 404 — the durable store is the authority on
+        terminal state, so a cleaned-up live ref does not make a finished run
+        unaddressable. A run that never existed still 404s.
+        """
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
@@ -5672,6 +5740,14 @@ class APIServerAdapter(BasePlatformAdapter):
         task = self._active_run_tasks.get(run_id)
 
         if agent is None and task is None:
+            # No live ref. If the store knows this run and it is terminal, stop
+            # is an idempotent no-op returning the same result; otherwise 404.
+            if self._broker_enabled():
+                row = self._durable_store.get_run(run_id)
+                if row is not None:
+                    return web.json_response(
+                        {"run_id": run_id, "status": "stopped", "idempotent_replay": True}
+                    )
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
 
         self._set_run_status(run_id, "stopping", last_event="run.stopping")
@@ -5799,6 +5875,10 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app["api_server_adapter"] = self
             if self.gateway_runner is not None:
                 self._app["gateway_runner"] = self.gateway_runner
+
+            # V2.8: reconcile phantom in-flight runs to a deterministic terminal
+            # state (stopped) before serving. No-op unless a durable store is set.
+            self.reconcile_durable_runs()
 
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
