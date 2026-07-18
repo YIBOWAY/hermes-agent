@@ -276,3 +276,123 @@ class TestLegacyApprovalUnchanged:
                 with approval_mod._lock:
                     approval_mod._gateway_queues.pop(run_id, None)
                 interrupted.set()
+
+
+class TestApprovalConsumeDoesNotBurnOnNonSuccess:
+    """A6: non-success approval paths must not change the prior grant fact."""
+
+    @pytest.mark.asyncio
+    async def test_not_pending_leaves_grant_intact_for_retry(self, store):
+        """No queue entry → 409 approval_not_pending AND grant still consumable."""
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            run_id, mock_agent, interrupted = await _start_live_run(adapter, cli)
+            try:
+                # Issue a real challenge via notify path, but do NOT enqueue a
+                # pending approval entry — simulates drained/raced queue.
+                entry = _pending_entry()
+                notify = approval_mod._gateway_notify_cbs.get(run_id)
+                assert notify is not None
+                notify(dict(entry.data))
+                ch = dict(
+                    store._conn.execute(
+                        "SELECT * FROM approval_grants WHERE run_id = ?", (run_id,)
+                    ).fetchone()
+                )
+                assert ch["consumed"] == 0
+
+                # Empty the queue deliberately (session key exists, nothing pending).
+                with approval_mod._lock:
+                    approval_mod._gateway_queues.pop(run_id, None)
+
+                bad = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={
+                        "choice": "once",
+                        "challenge_id": ch["challenge_id"],
+                        "action_digest": ch["action_digest"],
+                    },
+                )
+                assert bad.status == 409
+                body = await bad.json()
+                err = body.get("error") or body
+                code = err.get("code") if isinstance(err, dict) else None
+                assert code in {"approval_not_pending", "approval_not_active"} or (
+                    "pending" in str(body).lower() or "active" in str(body).lower()
+                )
+
+                row = dict(
+                    store._conn.execute(
+                        "SELECT consumed FROM approval_grants WHERE challenge_id = ?",
+                        (ch["challenge_id"],),
+                    ).fetchone()
+                )
+                assert row["consumed"] == 0, "grant must not burn on non-success"
+
+                # Retry with a real pending entry must still succeed (grant intact).
+                entry2 = _pending_entry()
+                with approval_mod._lock:
+                    approval_mod._gateway_queues[run_id] = [entry2]
+                good = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={
+                        "choice": "once",
+                        "challenge_id": ch["challenge_id"],
+                        "action_digest": ch["action_digest"],
+                    },
+                )
+                assert good.status == 200
+                assert entry2.event.is_set()
+            finally:
+                with approval_mod._lock:
+                    approval_mod._gateway_queues.pop(run_id, None)
+                interrupted.set()
+
+    @pytest.mark.asyncio
+    async def test_resolve_zero_restores_grant(self, store):
+        """If resolve returns 0 after consume (TOCTOU), grant is restored."""
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            run_id, mock_agent, interrupted = await _start_live_run(adapter, cli)
+            try:
+                entry = _pending_entry()
+                with approval_mod._lock:
+                    approval_mod._gateway_queues[run_id] = [entry]
+                notify = approval_mod._gateway_notify_cbs.get(run_id)
+                assert notify is not None
+                notify(dict(entry.data))
+                ch = dict(
+                    store._conn.execute(
+                        "SELECT * FROM approval_grants WHERE run_id = ?", (run_id,)
+                    ).fetchone()
+                )
+
+                # has_blocking_approval True, but resolve forced to 0.
+                with patch(
+                    "tools.approval.resolve_gateway_approval", return_value=0
+                ), patch(
+                    "tools.approval.has_blocking_approval", return_value=True
+                ):
+                    resp = await cli.post(
+                        f"/v1/runs/{run_id}/approval",
+                        json={
+                            "choice": "once",
+                            "challenge_id": ch["challenge_id"],
+                            "action_digest": ch["action_digest"],
+                        },
+                    )
+                assert resp.status == 409
+                row = dict(
+                    store._conn.execute(
+                        "SELECT consumed FROM approval_grants WHERE challenge_id = ?",
+                        (ch["challenge_id"],),
+                    ).fetchone()
+                )
+                assert row["consumed"] == 0
+                assert not entry.event.is_set()
+            finally:
+                with approval_mod._lock:
+                    approval_mod._gateway_queues.pop(run_id, None)
+                interrupted.set()

@@ -5801,10 +5801,13 @@ class APIServerAdapter(BasePlatformAdapter):
         run_id = request.match_info["run_id"]
         status = self._run_statuses.get(run_id)
         if status is None:
-            return web.json_response(
-                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
-                status=404,
-            )
+            # After restart the live map may be empty while the durable row (and
+            # any outstanding grant) still exists. Do not 404 solely on memory.
+            if not (self._broker_enabled() and self._durable_store.get_run(run_id) is not None):
+                return web.json_response(
+                    _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                    status=404,
+                )
 
         try:
             body = await request.json()
@@ -5824,12 +5827,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
-        # V2.7 (contract row 6): when a durable store is configured, an approval
-        # response must present the exact challenge (challenge_id + matching
-        # action_digest) and consume it — single-use + TTL + compare-and-swap.
-        # A stale / expired / digest-mismatched / replayed / cross-run grant is
-        # rejected with 409 and NEVER resolves the queue; a failed consume leaves
-        # the real grant intact. Legacy path (no store) is unchanged below.
+        # V2.7 (contract row 6) + A6 fix: validate the exact challenge first, then
+        # require an active pending session, THEN CAS-consume, THEN resolve.
+        # Consuming before resolve burned single-use grants on approval_not_active
+        # / approval_not_pending paths — plan A6 forbids changing the prior fact
+        # on non-success. If resolve still returns 0 after a successful consume
+        # (TOCTOU race), restore the grant so the client can retry.
+        challenge_id_str: Optional[str] = None
+        action_digest_str: Optional[str] = None
         if self._broker_enabled():
             challenge_id = body.get("challenge_id")
             action_digest = body.get("action_digest")
@@ -5841,9 +5846,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     ),
                     status=409,
                 )
-            grant = self._durable_store.get_approval_challenge(str(challenge_id))
+            challenge_id_str = str(challenge_id)
+            action_digest_str = str(action_digest)
+            grant = self._durable_store.get_approval_challenge(challenge_id_str)
             if grant is None or grant.get("run_id") != run_id:
-                # Unknown challenge, or one issued for a different run.
                 return web.json_response(
                     _openai_error(
                         "Approval challenge is invalid for this run",
@@ -5851,10 +5857,21 @@ class APIServerAdapter(BasePlatformAdapter):
                     ),
                     status=409,
                 )
-            consumed = self._durable_store.consume_approval(
-                str(challenge_id), action_digest=str(action_digest)
-            )
-            if not consumed:
+            # Pre-flight (no mutate): already used / expired / digest mismatch
+            # must leave the real grant intact and never touch the queue.
+            if grant.get("consumed"):
+                return web.json_response(
+                    _openai_error(
+                        "Approval challenge is stale, expired, already used, or mismatched",
+                        code="approval_challenge_invalid",
+                    ),
+                    status=409,
+                )
+            try:
+                expires_at = float(grant.get("expires_at") or 0.0)
+            except (TypeError, ValueError):
+                expires_at = 0.0
+            if expires_at <= time.time() or str(grant.get("action_digest") or "") != action_digest_str:
                 return web.json_response(
                     _openai_error(
                         "Approval challenge is stale, expired, already used, or mismatched",
@@ -5865,6 +5882,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         approval_session_key = self._run_approval_sessions.get(run_id)
         if not approval_session_key:
+            # Grant NOT consumed — client may retry when session is live again.
             return web.json_response(
                 _openai_error(
                     f"Run has no active approval session: {run_id}",
@@ -5873,23 +5891,65 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=409,
             )
 
+        from tools.approval import has_blocking_approval, resolve_gateway_approval
+
+        if not has_blocking_approval(approval_session_key):
+            # Nothing pending — do not burn the durable grant.
+            return web.json_response(
+                _openai_error(
+                    f"Run has no pending approval: {run_id}",
+                    code="approval_not_pending",
+                ),
+                status=409,
+            )
+
+        if self._broker_enabled() and challenge_id_str is not None and action_digest_str is not None:
+            consumed = self._durable_store.consume_approval(
+                challenge_id_str, action_digest=action_digest_str
+            )
+            if not consumed:
+                return web.json_response(
+                    _openai_error(
+                        "Approval challenge is stale, expired, already used, or mismatched",
+                        code="approval_challenge_invalid",
+                    ),
+                    status=409,
+                )
+
         resolve_all = (
             _coerce_request_bool(body.get("all"), default=False)
             or _coerce_request_bool(body.get("resolve_all"), default=False)
         )
         try:
-            from tools.approval import resolve_gateway_approval
-
             resolved = resolve_gateway_approval(
                 approval_session_key,
                 choice,
                 resolve_all=resolve_all,
             )
         except Exception as exc:
+            # Resolve blew up after consume — restore grant so retry is possible.
+            if self._broker_enabled() and challenge_id_str is not None:
+                try:
+                    self._durable_store.release_approval_consume(challenge_id_str)
+                except Exception:
+                    logger.exception(
+                        "[api_server] failed to restore approval grant %s after resolve error",
+                        challenge_id_str,
+                    )
             logger.exception("[api_server] approval resolution failed for run %s", run_id)
             return web.json_response(_openai_error(str(exc)), status=500)
 
         if resolved <= 0:
+            # TOCTOU: queue drained between has_blocking_approval and resolve.
+            # Restore the single-use grant — non-success must not change the fact.
+            if self._broker_enabled() and challenge_id_str is not None:
+                try:
+                    self._durable_store.release_approval_consume(challenge_id_str)
+                except Exception:
+                    logger.exception(
+                        "[api_server] failed to restore approval grant %s after resolve=0",
+                        challenge_id_str,
+                    )
             return web.json_response(
                 _openai_error(
                     f"Run has no pending approval: {run_id}",
@@ -5936,6 +5996,10 @@ class APIServerAdapter(BasePlatformAdapter):
         result (200), never a 404 — the durable store is the authority on
         terminal state, so a cleaned-up live ref does not make a finished run
         unaddressable. A run that never existed still 404s.
+
+        Idempotent responses report the **actual** terminal status from the
+        store (succeeded/failed/stopped) — never coerce a succeeded/failed run
+        into ``stopped`` (plan A6: stop must not rewrite the terminal fact).
         """
         auth_err = self._check_auth(request)
         if auth_err:
@@ -5946,13 +6010,37 @@ class APIServerAdapter(BasePlatformAdapter):
         task = self._active_run_tasks.get(run_id)
 
         if agent is None and task is None:
-            # No live ref. If the store knows this run and it is terminal, stop
-            # is an idempotent no-op returning the same result; otherwise 404.
+            # No live ref. If the store knows this run, return its actual status
+            # (idempotent no-op for terminals; mark-stopped for phantoms).
             if self._broker_enabled():
                 row = self._durable_store.get_run(run_id)
                 if row is not None:
+                    store_status = str(row.get("status") or "")
+                    if store_status in {"succeeded", "failed", "stopped"}:
+                        return web.json_response(
+                            {
+                                "run_id": run_id,
+                                "status": store_status,
+                                "idempotent_replay": True,
+                            }
+                        )
+                    # Non-terminal phantom (no live agent): stop intent lands.
+                    try:
+                        from gateway.durable_runs import RunState
+
+                        self._durable_store.transition(
+                            run_id, RunState.STOPPED, strict=False
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[api_server] durable stop transition failed for %s", run_id
+                        )
                     return web.json_response(
-                        {"run_id": run_id, "status": "stopped", "idempotent_replay": True}
+                        {
+                            "run_id": run_id,
+                            "status": "stopped",
+                            "idempotent_replay": True,
+                        }
                     )
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
 
