@@ -9,12 +9,15 @@
 > unfakeable acceptance tests are derived directly from §6. **Red line: zero live
 > effect until V2.11 is green and V2.12 (install/restart) is separately authorized.**
 
-> **Current delivery evidence (2026-07-19): ISOLATED CODE ACCEPTED / LIVE NOT
-> INSTALLED.** The current implementation is an uncommitted dirty patch on
-> `codex/v2-live-integration@b3343a658`; live remains
-> `codex/v2-live-installed@916f5fbf5` with durable OFF. The frozen related suite
-> is 408 passed, the real conversation-loop suite is 436 passed, Ruff/diff check
-> are green, and two independent adversarial reviews ACCEPT. This evidence does
+> **Current delivery evidence (2026-07-19): ISOLATED CODE COMMITTED / LIVE NOT
+> INSTALLED.** The implementation is committed on
+> `codex/v2-live-integration@a22d21b207661849a78bb236e81192cf5295cbd6`
+> (release parent `b3343a658f62`); live remains
+> `codex/v2-live-installed@916f5fbf5` with durable OFF. Fresh release validation
+> has 389 focused durable/API/approval/provider/stop tests and 436 real
+> conversation-loop tests passing, with Ruff and `git diff --check` green. The
+> earlier 408-test frozen suite and two independent adversarial ACCEPT reviews
+> remain historical pre-commit evidence. This evidence does
 > not authorize install, restart, provider use, dispatch, browser mutation, or a
 > public composer.
 >
@@ -135,3 +138,20 @@ Zero live effect until V2.11 green + V2.12 separately authorized. No real tradin
 provider/paper/live/broker/Gate/redirect flips, no service start/stop. `chat_write_ready`
 / browser mutation / worker claim-dispatch / public composer stay **OFF**. All V2 work
 lands in the isolated worktree; the live checkout is untouched.
+
+## 8. Manual-update compatibility policy
+
+The owner may update the live Hermes checkout/install manually. Updates are never
+performed by HQA, a cron job, or an agent. A local deterministic `--no-agent`
+compatibility watcher may compare checkout/install/runtime identity with the last
+accepted observation and, only after a change, run bounded local-file and loopback
+GET-only probes against HQA and `ai-quant-platform`. It must not read provider
+credentials, submit a Run, mutate a Session, auto-patch, roll back, restart Hermes,
+or enable any write gate.
+
+An identity change is not automatically compatible. Contract drift, an unreachable
+authority, or a source/install/runtime mismatch produces a content-addressed report
+and keeps write readiness false. The normal post-update gate is the focused contract
+suite plus the deterministic probe; Hermes' roughly 40k-test upstream whole-product
+suite is reserved for an explicitly chosen high-risk/upstream-wide audit and is not a
+routine post-update requirement.
