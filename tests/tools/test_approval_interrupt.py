@@ -158,3 +158,46 @@ class TestApprovalInterrupt:
         assert not t.is_alive()
         # Timed out (no resolution) because the foreign interrupt was ignored.
         assert result_holder["result"] == {"resolved": False, "choice": None, "reason": None}
+
+    def test_stop_landing_during_wait_wins_over_immediate_approval_signal(self):
+        """Deterministic stop→approve race: post-wake recheck returns deny."""
+        from tools import approval as mod
+        from tools.interrupt import set_interrupt
+
+        mod._get_approval_config = lambda: {"timeout": 300}
+        result_holder = {}
+        notified = threading.Event()
+        payload_holder = {}
+
+        def _notify(payload):
+            payload_holder.update(payload)
+            notified.set()
+
+        def _worker():
+            result_holder["result"] = mod._await_gateway_decision(
+                self.SESSION_KEY,
+                _notify,
+                {
+                    "command": "rm -rf /tmp/whatever",
+                    "description": "recursive delete",
+                    "pattern_key": "rm_rf",
+                    "pattern_keys": ["rm_rf"],
+                },
+            )
+
+        worker = threading.Thread(target=_worker, daemon=True)
+        worker.start()
+        assert notified.wait(timeout=5)
+
+        # Stop commits while the worker is blocked in Event.wait(); an almost
+        # simultaneous approval wake-up must not turn that stop into consent.
+        set_interrupt(True, worker.ident)
+        assert mod.resolve_gateway_approval(
+            self.SESSION_KEY,
+            "once",
+            approval_id=payload_holder["approval_id"],
+        ) == 1
+
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        assert result_holder["result"]["choice"] == "deny"

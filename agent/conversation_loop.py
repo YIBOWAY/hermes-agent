@@ -1387,11 +1387,55 @@ def run_conversation(
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
                         )
+                    attempt_route = {
+                        "model": agent.model
+                        if isinstance(agent.model, str) and agent.model
+                        else None,
+                        "provider": agent.provider
+                        if isinstance(agent.provider, str) and agent.provider
+                        else None,
+                    }
+                    attempt_callback = getattr(
+                        agent, "_provider_attempt_callback", None
+                    )
+                    if callable(attempt_callback):
+                        try:
+                            attempt_callback(dict(attempt_route))
+                        except Exception:
+                            logger.debug(
+                                "provider attempt evidence callback failed",
+                                exc_info=True,
+                            )
                     if _use_streaming:
-                        return agent._interruptible_streaming_api_call(
+                        provider_response = agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
                         )
-                    return agent._interruptible_api_call(next_api_kwargs)
+                    else:
+                        provider_response = agent._interruptible_api_call(
+                            next_api_kwargs
+                        )
+                    if provider_response is not None:
+                        response_model = getattr(provider_response, "model", None)
+                        response_receipt = {
+                            "model": (
+                                response_model
+                                if isinstance(response_model, str) and response_model
+                                else attempt_route["model"]
+                            ),
+                            "provider": attempt_route["provider"],
+                        }
+                        response_callback = getattr(
+                            agent, "_provider_response_callback", None
+                        )
+                        if callable(response_callback):
+                            try:
+                                response_callback(dict(response_receipt))
+                            except Exception:
+                                logger.debug(
+                                    "provider response evidence callback failed",
+                                    exc_info=True,
+                                )
+                    return provider_response
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 

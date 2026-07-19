@@ -9,6 +9,27 @@
 > unfakeable acceptance tests are derived directly from §6. **Red line: zero live
 > effect until V2.11 is green and V2.12 (install/restart) is separately authorized.**
 
+> **Current delivery evidence (2026-07-19): ISOLATED CODE ACCEPTED / LIVE NOT
+> INSTALLED.** The current implementation is an uncommitted dirty patch on
+> `codex/v2-live-integration@b3343a658`; live remains
+> `codex/v2-live-installed@916f5fbf5` with durable OFF. The frozen related suite
+> is 408 passed, the real conversation-loop suite is 436 passed, Ruff/diff check
+> are green, and two independent adversarial reviews ACCEPT. This evidence does
+> not authorize install, restart, provider use, dispatch, browser mutation, or a
+> public composer.
+>
+> The implementation refines §1/§2 approval and provider evidence as follows:
+> `approval.decision_recorded` is the immutable human choice;
+> `approval.release_committed` is the durable at-most-once linearization point
+> with `waiter_signal_status=unknown`; only a later `approval.signalled` proves
+> the exact in-process waiter observed `Event.set()`. HTTP reports
+> `decision_status=committed` plus `waiter_signal_status=confirmed|unknown` and
+> never treats either as tool execution outcome. Actual provider/model/usage is
+> emitted only from an execution-middleware response receipt; preflight,
+> middleware short-circuit, provider exception, requested route, and fallback
+> config never counterfeit actual evidence. Public evidence contains only the
+> observed model/provider, not fallback secrets or routing configuration.
+
 The platform must never *project* fake upstream run state. All run truth lives in
 Hermes' canonical authority; the platform reads it through `OfficialHermesHttpAdapter`
 (V2.10). If any guarantee in this matrix cannot be met, the production adapter reports
@@ -46,8 +67,8 @@ queued ──▶ running ──▶ succeeded        (terminal)
 | `succeeded` | `completed` | rename to contract term |
 | `failed` | `failed` | 1:1 |
 | `stopped` | `cancelled` | rename to contract term |
-| — | `waiting_for_approval` | **sub-state of `running`**, surfaced as `running` + `awaiting=approval` |
-| — | `stopping` | **sub-state**, surfaced as `running` + `awaiting=stop` until terminal `stopped` |
+| — | `waiting_for_approval` | **sub-state of `running`**, surfaced as `running` + `substate=waiting_for_approval` |
+| — | `stopping` | **sub-state**, surfaced as `running` + `substate=stopping` until terminal `stopped` |
 
 Invariant: exactly the five contract states; upstream-only states are projected onto
 sub-states, never exposed as top-level status.
@@ -73,7 +94,7 @@ sub-states, never exposed as top-level status.
 | `POST /v1/runs` | submit-or-get by request identity | 202 + `run_id`; honors `Idempotency-Key`; persists canonical digest |
 | `GET /v1/runs/{run_id}` | current status + evidence | 404 `run_not_found`; includes requested/actual policy, usage, fallback |
 | `GET /v1/runs/{run_id}/events?since={cursor}` | page replay (no gap/dup) + SSE live tail | honors `Last-Event-ID` / `since`; stable `event_id` + monotonic `seq` |
-| `POST /v1/runs/{run_id}/approval` | respond to an exact challenge | single-use + TTL + CAS; 409 on stale/expired/digest-mismatch |
+| `POST /v1/runs/{run_id}/approval` | respond to an exact challenge | single-use + TTL + CAS; reports committed decision and confirmed/unknown waiter signal separately; 409 on stale/expired/digest-mismatch |
 | `POST /v1/runs/{run_id}/stop` | idempotent stop intent | repeat ⇒ same result, even after terminal |
 | `GET /v1/capabilities` | **behavioral** capability probe + negotiation | reports what the authority can do *now*, with evidence |
 

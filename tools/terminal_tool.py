@@ -2374,11 +2374,6 @@ def terminal_tool(
         # Pre-exec security checks (tirith + dangerous command detection)
         # Skip check if force=True (user has confirmed they want to run it)
         approval_note = None
-        # True when the user explicitly approved this run (or pre-confirmed via
-        # force).  Drives the clean-interrupt-slate clear before env.execute so
-        # an approved command can't be SIGINT-killed by a bit that landed during
-        # the approval-wait (see clear_current_thread_interrupt).
-        _approved_run = bool(force)
         if not force:
             approval = _check_all_guards(
                 command, env_type,
@@ -2415,10 +2410,27 @@ def terminal_tool(
             if approval.get("user_approved"):
                 desc = approval.get("description", "flagged as dangerous")
                 approval_note = f"Command required approval ({desc}) and was approved by the user."
-                _approved_run = True
             elif approval.get("smart_approved"):
                 desc = approval.get("description", "flagged as dangerous")
                 approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
+
+        # A stop/interrupt that landed during approval wins before every spawn
+        # surface (foreground env.execute and background process registry).
+        from tools.interrupt import is_interrupted as _is_interrupted_before_spawn
+
+        if _is_interrupted_before_spawn():
+            result = {
+                "output": "[Command interrupted before execution]",
+                "exit_code": 130,
+                "error": "Command was not started because the run was stopped.",
+                "status": "interrupted",
+            }
+            if approval_note:
+                result["approval"] = approval_note.replace(
+                    "approved by the user.",
+                    "approved by the user, but not executed because stop won.",
+                )
+            return json.dumps(result, ensure_ascii=False)
 
         # Validate workdir against shell injection
         if workdir:
@@ -2465,6 +2477,16 @@ def terminal_tool(
                 session_key=session_key,
             )
             try:
+                if _is_interrupted_before_spawn():
+                    return json.dumps(
+                        {
+                            "output": "[Command interrupted before execution]",
+                            "exit_code": 130,
+                            "error": "Background command was not started because the run was stopped.",
+                            "status": "interrupted",
+                        },
+                        ensure_ascii=False,
+                    )
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
                         command=command,
@@ -2708,16 +2730,6 @@ def terminal_tool(
             result = None
             command_cwd = None
 
-            # Clean interrupt slate for an approved command, ONCE before the
-            # retry loop: drop a stale bit that landed on this thread during the
-            # approval-wait so it can't SIGINT the just-approved run.  Do NOT
-            # re-clear inside the loop -- a genuine interrupt arriving during the
-            # backoff sleep between retries must survive and abort the command
-            # (caught by the next attempt's _wait_for_process poll loop -> 130).
-            if _approved_run:
-                from tools.interrupt import clear_current_thread_interrupt
-                clear_current_thread_interrupt()
-
             while retry_count <= max_retries:
                 try:
                     command_cwd = _resolve_command_cwd(
@@ -2735,6 +2747,17 @@ def terminal_tool(
                         # reads, RPC reads) intentionally stay unbounded.
                         "bounded_capture": True,
                     }
+                    # Last possible check at the actual foreground executor seam.
+                    if _is_interrupted_before_spawn():
+                        return json.dumps(
+                            {
+                                "output": "[Command interrupted before execution]",
+                                "exit_code": 130,
+                                "error": "Command was not started because the run was stopped.",
+                                "status": "interrupted",
+                            },
+                            ensure_ascii=False,
+                        )
                     result = env.execute(command, **execute_kwargs)
                 except Exception as e:
                     error_str = str(e).lower()

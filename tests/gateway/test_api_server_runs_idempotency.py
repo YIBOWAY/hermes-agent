@@ -11,7 +11,7 @@ of run identity. Two submissions share identity iff both key and digest match.
   ``repr()``).
 * Durability: a fresh adapter on the **same** DB path recovers the **same** Run
   after "restart" (contract row 3 underlies row 2's by-identity recovery).
-* No ``Idempotency-Key`` ⇒ legacy behavior is unchanged (fresh run each time).
+* No ``Idempotency-Key`` ⇒ fresh-run identity behavior is unchanged.
 
 Red line: hermetic only — the durable store is injected with a throwaway
 ``tmp_path`` DB; no live state, no network. These tests fail until
@@ -76,6 +76,63 @@ def _completed_agent_mock():
 
 class TestIdempotentSubmit:
     @pytest.mark.asyncio
+    async def test_initial_status_failure_cleans_live_state_and_returns_503(
+        self, store
+    ):
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+        with patch.object(
+            adapter,
+            "_set_run_status",
+            side_effect=OSError("durable status unavailable"),
+        ), patch.object(adapter, "_create_agent") as mock_create:
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                payload = await response.json()
+
+        assert response.status == 503
+        assert payload["error"]["code"] == "durable_unavailable"
+        row = dict(store._conn.execute("SELECT * FROM runs").fetchone())
+        run_id = row["run_id"]
+        assert row["status"] == "stopped"
+        for mapping in (
+            adapter._run_streams,
+            adapter._run_streams_created,
+            adapter._run_approval_sessions,
+            adapter._run_statuses,
+            adapter._run_event_seq,
+            adapter._run_event_subscribers,
+            adapter._active_run_agents,
+            adapter._active_run_tasks,
+        ):
+            assert run_id not in mapping
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_previous_response_session_is_persisted_as_run_identity(self, store):
+        adapter = _make_adapter(durable_store=store)
+        adapter._response_store.put(
+            "resp_previous",
+            {
+                "session_id": "session_original",
+                "conversation_history": [{"role": "user", "content": "before"}],
+            },
+        )
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_create.return_value = _completed_agent_mock()
+                response = await cli.post(
+                    "/v1/runs",
+                    json={"input": "continue", "previous_response_id": "resp_previous"},
+                    headers={"Idempotency-Key": "idem-previous"},
+                )
+                assert response.status == 202
+                run_id = (await response.json())["run_id"]
+
+        assert store.get_run(run_id)["session_id"] == "session_original"
+
+    @pytest.mark.asyncio
     async def test_same_identity_returns_same_run_no_duplicate(self, store):
         """Same Idempotency-Key + same body ⇒ same run_id, agent created once."""
         adapter = _make_adapter(durable_store=store)
@@ -96,6 +153,76 @@ class TestIdempotentSubmit:
                 assert mock_create.call_count == 1
                 # Replay is explicitly marked so callers can tell it apart.
                 assert d2.get("idempotent_replay") is True
+                assert d2["status"] in {
+                    "queued",
+                    "running",
+                    "succeeded",
+                    "failed",
+                    "stopped",
+                }
+                assert d2["status"] not in {
+                    "started",
+                    "recovered",
+                    "completed",
+                    "cancelled",
+                    "waiting_for_approval",
+                    "stopping",
+                }
+
+    @pytest.mark.asyncio
+    async def test_duplicate_with_unknown_stored_state_fails_closed(self, store):
+        body = {"input": "hello"}
+        submit = store.submit_or_get(
+            idempotency_key="idem-invalid-state", request_body=body
+        )
+        store._conn.execute(
+            "UPDATE runs SET status = ? WHERE run_id = ?",
+            ("future_unreviewed_state", submit.run_id),
+        )
+        store._conn.commit()
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                response = await cli.post(
+                    "/v1/runs",
+                    json=body,
+                    headers={"Idempotency-Key": "idem-invalid-state"},
+                )
+                response_body = await response.json()
+
+        assert response.status == 503
+        assert response_body["error"]["code"] == "run_state_invalid"
+        assert "future_unreviewed_state" not in str(response_body)
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_duplicate_lookup_failure_returns_durable_503(
+        self, store, monkeypatch
+    ):
+        body = {"input": "hello"}
+        store.submit_or_get(idempotency_key="idem-read-fails", request_body=body)
+        monkeypatch.setattr(
+            store,
+            "get_run",
+            lambda run_id: (_ for _ in ()).throw(OSError("database unavailable")),
+        )
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                response = await cli.post(
+                    "/v1/runs",
+                    json=body,
+                    headers={"Idempotency-Key": "idem-read-fails"},
+                )
+                response_body = await response.json()
+
+        assert response.status == 503
+        assert response_body["error"]["code"] == "durable_unavailable"
+        mock_create.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_same_key_different_body_conflicts_409(self, store):
@@ -212,7 +339,7 @@ class TestIdempotencyDurability:
 
 
 # ---------------------------------------------------------------------------
-# legacy behavior preserved when no Idempotency-Key is present
+# fresh-run identity behavior preserved when no Idempotency-Key is present
 # ---------------------------------------------------------------------------
 
 
@@ -245,6 +372,133 @@ class TestLegacySubmitUnchanged:
                 resp = await cli.post("/v1/runs", json={"input": "hello"})
                 assert resp.status == 202
                 data = await resp.json()
-                assert data["status"] == "started"
+                assert data["status"] == "queued"
                 assert data["run_id"].startswith("run_")
                 assert mock_create.call_count == 1
+
+
+class TestDurableAdmissionFailsClosed:
+    @pytest.mark.asyncio
+    async def test_broker_seed_failure_stops_unadmitted_run(self, store, monkeypatch):
+        adapter = _make_adapter(durable_store=store)
+        monkeypatch.setattr(
+            adapter,
+            "_broker_seed",
+            lambda run_id: (_ for _ in ()).throw(RuntimeError("broker seed failed")),
+        )
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                response = await cli.post(
+                    "/v1/runs", json={"input": "must seed broker"}
+                )
+                response_body = await response.json()
+
+        assert response.status == 503
+        assert response_body["error"]["code"] == "durable_unavailable"
+        mock_create.assert_not_called()
+        assert not adapter._active_run_tasks
+        assert not adapter._run_streams
+        rows = store._conn.execute("SELECT status FROM runs").fetchall()
+        assert [row["status"] for row in rows] == ["stopped"]
+
+    @pytest.mark.parametrize("failure_mode", ["false", "exception"])
+    @pytest.mark.asyncio
+    async def test_requested_policy_failure_rejects_before_agent_creation(
+        self, store, monkeypatch, failure_mode
+    ):
+        adapter = _make_adapter(durable_store=store)
+
+        def _fail_requested_policy(run_id, policy):
+            if failure_mode == "exception":
+                raise OSError("requested-policy evidence unavailable")
+            return False
+
+        monkeypatch.setattr(store, "set_requested_policy", _fail_requested_policy)
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                response = await cli.post(
+                    "/v1/runs", json={"input": "must preserve requested policy"}
+                )
+                response_body = await response.json()
+
+        assert response.status == 503
+        assert response_body["error"]["code"] == "durable_unavailable"
+        mock_create.assert_not_called()
+        assert not adapter._active_run_tasks
+        assert not adapter._run_streams
+        assert not adapter._run_statuses
+        assert not adapter._run_event_seq
+        rows = store._conn.execute("SELECT status FROM runs").fetchall()
+        assert [row["status"] for row in rows] == ["stopped"]
+
+    @pytest.mark.asyncio
+    async def test_register_failure_rejects_before_agent_creation(self, store, monkeypatch):
+        adapter = _make_adapter(durable_store=store)
+        monkeypatch.setattr(
+            store,
+            "register_run",
+            lambda **kwargs: (_ for _ in ()).throw(OSError("durable DB unavailable")),
+        )
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                response = await cli.post("/v1/runs", json={"input": "must persist"})
+
+        assert response.status == 503
+        assert mock_create.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_submit_failure_rejects_before_agent_creation(self, store, monkeypatch):
+        adapter = _make_adapter(durable_store=store)
+        monkeypatch.setattr(
+            store,
+            "submit_or_get",
+            lambda **kwargs: (_ for _ in ()).throw(OSError("durable DB unavailable")),
+        )
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                response = await cli.post(
+                    "/v1/runs",
+                    json={"input": "must persist"},
+                    headers={"Idempotency-Key": "fail-closed"},
+                )
+
+        assert response.status == 503
+        assert mock_create.call_count == 0
+
+
+class TestDurableReadFailsClosed:
+    @pytest.mark.parametrize("live_status_present", [False, True])
+    @pytest.mark.asyncio
+    async def test_get_run_lookup_failure_returns_durable_503(
+        self, store, monkeypatch, live_status_present
+    ):
+        run_id = "run_lookup_failure"
+        adapter = _make_adapter(durable_store=store)
+        if live_status_present:
+            adapter._run_statuses[run_id] = {
+                "run_id": run_id,
+                "status": "running",
+            }
+        monkeypatch.setattr(
+            store,
+            "get_run",
+            lambda requested_id: (_ for _ in ()).throw(
+                OSError("database unavailable")
+            ),
+        )
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.get(f"/v1/runs/{run_id}")
+            response_body = await response.json()
+
+        assert response.status == 503
+        assert response_body["error"]["code"] == "durable_unavailable"

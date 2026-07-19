@@ -2262,7 +2262,8 @@ def resolve_pre_tool_block(
             result = request_tool_approval(
                 tool_name,
                 details.message or "",
-                rule_key=details.rule_key or tool_name,
+                rule_key=details.rule_key or "",
+                args=dict(args or {}),
             )
         except Exception:
             # Fail-closed: if the gate itself errors, block rather than

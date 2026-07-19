@@ -92,7 +92,7 @@ from gateway.platforms.base import (
 from agent.redact import redact_sensitive_text
 from gateway.readiness import collect_runtime_readiness
 from utils import is_truthy_value
-from gateway.durable_runs import DurableRunStore, canonical_digest
+from gateway.durable_runs import DurableRunStore
 from gateway.relay.descriptor import CONTRACT_VERSION as _RELAY_CONTRACT_VERSION
 
 logger = logging.getLogger(__name__)
@@ -101,6 +101,10 @@ logger = logging.getLogger(__name__)
 # behavioral probe (V2.9) is active. Tracks the relay descriptor's additive-only
 # contract version so platform/upstream negotiate the same schema idiom.
 RELAY_CONTRACT_VERSION = _RELAY_CONTRACT_VERSION
+
+
+class DurableEvidenceError(RuntimeError):
+    """Canonical run evidence exists but cannot be decoded faithfully."""
 
 
 def _hermes_version() -> str:
@@ -930,8 +934,8 @@ def build_durable_store(
     V2.13: the reviewed durable-run semantics (V2.2–V2.9) are dormant unless a
     store is passed to ``APIServerAdapter`` (``_broker_enabled()`` is simply
     ``store is not None``). This is the single, unit-testable construction
-    point ``gateway/run.py`` uses, and it is **opt-in / default-OFF** so the
-    legacy in-memory ``/v1/runs`` behavior stays byte-identical unless enabled.
+    point ``gateway/run.py`` uses, and it is **opt-in / default-OFF** so durable
+    persistence does not alter the in-memory execution path unless enabled.
 
     Enable via ``platforms.api_server.extra.durable_runs_enabled`` (an explicit
     value wins over the env var) or the ``API_SERVER_DURABLE_RUNS`` env var.
@@ -955,7 +959,23 @@ def build_durable_store(
 
             home = get_hermes_home()
         db_path = str(Path(home) / "durable_runs.db")
-    return DurableRunStore(db_path=str(db_path))
+    # Fence before opening SQLite: construction enables WAL and may execute
+    # CREATE/ALTER, so a losing process must be excluded before the first DB
+    # side effect, not merely later during HTTP connect().
+    from gateway.durable_runs import DurableAuthorityLock
+
+    authority_lock = DurableAuthorityLock(db_path)
+    if not authority_lock.acquire():
+        raise RuntimeError(
+            "another API server process owns the durable run database"
+        )
+    try:
+        return DurableRunStore(
+            db_path=str(db_path), authority_lock=authority_lock
+        )
+    except Exception:
+        authority_lock.release()
+        raise
 
 
 class APIServerAdapter(BasePlatformAdapter):
@@ -981,13 +1001,28 @@ class APIServerAdapter(BasePlatformAdapter):
     # should complete the interrupted work rather than acknowledge (#57056).
     interactive_resume: bool = False
 
-    def __init__(self, config: PlatformConfig, durable_store: Optional[Any] = None):
+    def __init__(
+        self,
+        config: PlatformConfig,
+        durable_store: Optional[Any] = None,
+        *,
+        owns_durable_store: bool = False,
+    ):
         super().__init__(config, Platform.API_SERVER)
         extra = config.extra or {}
         # Optional DurableRunAuthority store (gateway.durable_runs.DurableRunStore).
         # When None, /v1/runs keeps its legacy in-memory-only behavior; when set,
         # POST /v1/runs honors Idempotency-Key via durable submit-or-get (V2.2).
         self._durable_store = durable_store
+        self._owns_durable_store = bool(
+            owns_durable_store and durable_store is not None
+        )
+        self._durable_store_required = durable_store is not None
+        # Separate ownership dimensions: the adapter may borrow a store object
+        # while still exclusively owning the cross-process mutation fence.
+        self._durable_authority_lock: Optional[Any] = getattr(
+            durable_store, "authority_lock", None
+        )
         self._host: str = extra.get("host", os.getenv("API_SERVER_HOST", DEFAULT_HOST))
         raw_port = extra.get("port")
         if raw_port is None:
@@ -1031,6 +1066,11 @@ class APIServerAdapter(BasePlatformAdapter):
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
         # Stop is cooperative: the executor thread may outlive the HTTP request.
         self._stopping_run_ids: set[str] = set()
+        # Exact durable stop intent is append-once while a live task remains.
+        self._stop_intent_run_ids: set[str] = set()
+        # Local execution ended but canonical terminalization failed.  Never
+        # expose the surviving queued/running row as trustworthy live status.
+        self._run_authority_unavailable: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
         # Active approval session key for each run_id.  The approval core
@@ -2091,22 +2131,14 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # V2.9 (contract row 8): additive behavioral probe. Only when a durable
         # store is configured do we additively surface a contract_version and a
-        # `durable` block whose per-capability `grounded` is backed by a
-        # side-effect-free read-only store probe — never a bare "configured"
-        # flag, and never a mutating write. Legacy (no-store) payload above is
-        # byte-identical to before.
+        # `durable` block whose per-capability `grounded` is backed by a real
+        # transactional write/read/CAS probe that always rolls back. Legacy
+        # (no-store) payload above is byte-identical to before.
         if self._broker_enabled():
             payload["contract_version"] = RELAY_CONTRACT_VERSION
             payload["durable"] = self._capability_probes()
 
         return web.json_response(payload)
-
-    # Bogus ids used only for read-only schema/connectivity probes. Real run
-    # ids are ``run_<32 hex>`` (see ``_handle_runs``), so this prefix can never
-    # collide with a real row — the probe must return "no row / empty", which
-    # is exactly what proves the table is present and readable.
-    _PROBE_RUN_ID = "run_capprobe_deadbeef"
-    _PROBE_CHALLENGE_ID = "ch_capprobe_deadbeef"
 
     def _capability_probes(self) -> Dict[str, Dict[str, Any]]:
         """Behavioral capability probe for ``GET /v1/capabilities`` (V2.9).
@@ -2115,62 +2147,33 @@ class APIServerAdapter(BasePlatformAdapter):
         evidence}``:
 
         * ``supported`` — the code path exists (a durable store is configured).
-        * ``grounded`` — a *read-only, side-effect-free* store probe succeeded,
-          proving the underlying table is present and answers. We deliberately
-          never probe with a mutating write (``submit_or_get`` / ``append_event``
-          / ``consume_approval``): advertising a capability must not change
-          state. The single genuine live round-trip is ``replay_events`` (a
-          pure ``SELECT``); the rest are schema/connectivity reads against a
-          bogus id that must return "no row / empty".
-        * ``evidence`` — names the grounding signal (which probe), so a caller
-          can see *why* the capability is believed.
+        * ``grounded`` — the store's transaction probe exercised the capability's
+          write/read/CAS behavior and rolled the entire probe transaction back.
+        * ``evidence`` — names the transactional grounding signal.
 
         Fail-closed: any probe that raises degrades that capability to
         ``grounded=False`` rather than claiming support on a stale flag.
         """
-        store = self._durable_store
-
-        def _probe(evidence: str, read) -> Dict[str, Any]:
-            try:
-                read()
-            except Exception:  # fail-closed: a broken store is not grounded
-                logger.debug("capability probe failed for %s", evidence, exc_info=True)
-                return {"supported": True, "grounded": False, "evidence": evidence}
-            return {"supported": True, "grounded": True, "evidence": evidence}
-
+        capabilities = (
+            "idempotency",
+            "event_replay",
+            "approval_cas",
+            "idempotent_stop",
+            "restart_reconcile",
+            "run_evidence",
+        )
+        try:
+            grounded = self._durable_store.probe_capabilities()
+        except Exception:
+            logger.debug("transactional durable capability probe failed", exc_info=True)
+            grounded = {}
         return {
-            # Idempotency: grounded by the runs table answering a read (the
-            # write path submit_or_get is never exercised as a probe).
-            "idempotency": _probe(
-                "store.get_run",
-                lambda: store.get_run(self._PROBE_RUN_ID),
-            ),
-            # Event replay: the only true side-effect-free round-trip — a pure
-            # SELECT over run_events.
-            "event_replay": _probe(
-                "store.replay_events",
-                lambda: store.replay_events(self._PROBE_RUN_ID, since_seq=0),
-            ),
-            # Approval CAS: grounded by the approval_grants table answering a
-            # read; consume_approval (mutating CAS) is never used as a probe.
-            "approval_cas": _probe(
-                "store.get_approval_challenge",
-                lambda: store.get_approval_challenge(self._PROBE_CHALLENGE_ID),
-            ),
-            # Idempotent stop + restart reconcile + run status all read runs.
-            "idempotent_stop": _probe(
-                "store.get_run",
-                lambda: store.get_run(self._PROBE_RUN_ID),
-            ),
-            "restart_reconcile": _probe(
-                "store.list_non_terminal_runs",
-                lambda: store.list_non_terminal_runs(),
-            ),
-            # requested/actual evidence lives in the runs row's evidence cols.
-            "run_evidence": _probe(
-                "store.get_run",
-                lambda: store.get_run(self._PROBE_RUN_ID),
-            ),
+            capability: {
+                "supported": True,
+                "grounded": grounded.get(capability) is True,
+                "evidence": f"store.transactional_probe:{capability}",
+            }
+            for capability in capabilities
         }
 
     async def _handle_skills(self, request: "web.Request") -> "web.Response":
@@ -4760,8 +4763,18 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
+        # Durable authority is canonical.  Persist/verify it before mutating the
+        # in-memory projection so a failed transition can never be reported as
+        # running/succeeded to clients while provider work continues.
+        self._sync_durable_status(run_id, status)
+        return self._update_run_status_memory(run_id, status, **fields)
+
+    def _update_run_status_memory(
+        self, run_id: str, status: str, **fields: Any
+    ) -> Dict[str, Any]:
+        """Project a status after its canonical durable write already succeeded."""
         now = time.time()
-        current = self._run_statuses.get(run_id, {})
+        current = dict(self._run_statuses.get(run_id, {}))
         current.update({
             "object": "hermes.run",
             "run_id": run_id,
@@ -4771,9 +4784,6 @@ class APIServerAdapter(BasePlatformAdapter):
         current.setdefault("created_at", fields.pop("created_at", now))
         current.update(fields)
         self._run_statuses[run_id] = current
-        # V2.8: mirror the live status into the durable store (no-op unless the
-        # broker is configured). Keeps runs.status consistent for stop/reconcile.
-        self._sync_durable_status(run_id, status)
         return current
 
     # ------------------------------------------------------------------
@@ -4795,7 +4805,30 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_event_seq.setdefault(run_id, 0)
         self._run_event_subscribers.setdefault(run_id, [])
 
-    def _broker_publish(self, run_id: str, event: Optional[Dict[str, Any]]) -> None:
+    def _broker_fanout_record(self, record: Any) -> None:
+        """Fan out an already-committed canonical event without re-appending."""
+        run_id = str(record.run_id)
+        if run_id in self._run_event_terminal:
+            return
+        self._broker_seed(run_id)
+        self._run_event_seq[run_id] = int(record.seq)
+        enriched = dict(record.payload)
+        enriched["event"] = record.event_type
+        enriched["seq"] = record.seq
+        enriched["event_id"] = record.event_id
+        for queue in list(self._run_event_subscribers.get(run_id, [])):
+            try:
+                queue.put_nowait(enriched)
+            except Exception:
+                pass
+
+    def _broker_publish(
+        self,
+        run_id: str,
+        event: Optional[Dict[str, Any]],
+        *,
+        interrupt_on_failure: bool = True,
+    ) -> None:
         """Persist + fan out one event; ``None`` closes every subscriber queue.
 
         Thread-safe: producers call this from the executor thread via
@@ -4809,28 +4842,34 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             return
+        if run_id in self._run_event_terminal:
+            logger.warning(
+                "[api_server] rejected post-terminal event for run %s", run_id
+            )
+            return
         self._broker_seed(run_id)
-        seq = self._run_event_seq[run_id] + 1
-        self._run_event_seq[run_id] = seq
         event_type = str(event.get("event", "event"))
-        # Persist first: the store assigns the canonical event_id and the
-        # authoritative per-run seq. Fall back to the in-memory seq if the
-        # store is unreachable so live delivery is never blocked by storage.
+        # Persist first: no subscriber may observe an event that lacks a
+        # canonical durable identity.
         try:
             rec = self._durable_store.append_event(run_id, event_type, dict(event))
-            seq = rec.seq
-            event_id = rec.event_id
-        except Exception:
+        except Exception as exc:
+            self._run_authority_unavailable.add(run_id)
             logger.exception("[api_server] durable append_event failed for run %s", run_id)
-            event_id = f"evt_{uuid.uuid4().hex}"
-        enriched = dict(event)
-        enriched["seq"] = seq
-        enriched["event_id"] = event_id
-        for q in list(self._run_event_subscribers.get(run_id, [])):
-            try:
-                q.put_nowait(enriched)
-            except Exception:
-                pass
+            agent = self._active_run_agents.get(run_id)
+            if interrupt_on_failure and agent is not None:
+                try:
+                    agent.interrupt(
+                        "Durable run authority failed while recording an event; "
+                        "the run is stopping fail-closed."
+                    )
+                except Exception:
+                    logger.debug(
+                        "[api_server] could not interrupt run after durable failure",
+                        exc_info=True,
+                    )
+            raise RuntimeError("durable event persistence failed") from exc
+        self._broker_fanout_record(rec)
 
     def _broker_subscribe(self, run_id: str) -> "asyncio.Queue":
         """Attach a new subscriber queue for a live run."""
@@ -4886,25 +4925,104 @@ class APIServerAdapter(BasePlatformAdapter):
         "failed": "failed",
         "cancelled": "stopped",
     }
+    _PUBLIC_RUN_STATES = frozenset(
+        {"queued", "running", "succeeded", "failed", "stopped"}
+    )
+
+    @classmethod
+    def _public_run_status(cls, status: Dict[str, Any]) -> Dict[str, Any]:
+        """Project internal lifecycle names onto the stable five-state contract."""
+        projected = dict(status)
+        raw_status = str(projected.get("status") or "")
+        canonical = cls._STATUS_TO_RUNSTATE.get(raw_status)
+        if canonical is None and raw_status in cls._PUBLIC_RUN_STATES:
+            canonical = raw_status
+        if canonical is None:
+            raise ValueError("run status is outside the public five-state contract")
+        projected["status"] = canonical
+        if raw_status == "waiting_for_approval":
+            projected["substate"] = "waiting_for_approval"
+        elif raw_status == "stopping":
+            projected["substate"] = "stopping"
+        else:
+            projected.pop("substate", None)
+        return projected
+
+    @staticmethod
+    def _run_state_invalid_response(run_id: str) -> "web.Response":
+        """Fail closed when an internal status cannot be projected faithfully."""
+        logger.error(
+            "[api_server] refusing to expose unrecognized run status for %s", run_id
+        )
+        return web.json_response(
+            _openai_error(
+                "Run state is unavailable because its lifecycle value is invalid",
+                code="run_state_invalid",
+            ),
+            status=503,
+        )
+
+    @staticmethod
+    def _durable_unavailable_response() -> "web.Response":
+        """Return the stable fail-closed response for durable authority errors."""
+        return web.json_response(
+            _openai_error(
+                "Durable run authority is unavailable; retry later",
+                code="durable_unavailable",
+            ),
+            status=503,
+            headers={"Retry-After": "1"},
+        )
+
+    def _stop_unadmitted_durable_run(self, run_id: str) -> None:
+        """Best-effort terminal cleanup for a run rejected before task creation."""
+        try:
+            from gateway.durable_runs import RunState
+
+            self._durable_store.finalize_run(
+                run_id,
+                terminal_state=RunState.STOPPED,
+                event_type="run.stopped",
+                event_payload={
+                    "event": "run.stopped",
+                    "run_id": run_id,
+                    "reason": "admission_failed",
+                    "timestamp": time.time(),
+                },
+            )
+        except Exception:
+            logger.exception(
+                "[api_server] could not stop rejected durable run %s", run_id
+            )
 
     def _sync_durable_status(self, run_id: str, upstream_status: str) -> None:
         """V2.8 (contract row 7): mirror the live status into the durable store.
 
         Maps the upstream status name to the contract RunState and applies it via
-        a guarded transition. Best-effort: an illegal/terminal transition returns
-        False (terminal immutability) and storage failure never breaks the run.
+        a guarded transition.  Same-state writes are verified idempotently;
+        unknown/missing/illegal transitions raise and stop provider admission.
         """
         if not self._broker_enabled():
             return
         contract = self._STATUS_TO_RUNSTATE.get(upstream_status)
         if contract is None:
-            return
-        try:
-            from gateway.durable_runs import RunState
+            raise RuntimeError(f"durable status mapping is unknown: {upstream_status}")
+        from gateway.durable_runs import RunState
 
-            self._durable_store.transition(run_id, RunState(contract))
-        except Exception:
-            logger.exception("[api_server] durable status sync failed for %s", run_id)
+        row = self._durable_store.get_run(run_id)
+        if row is None:
+            raise RuntimeError(f"durable status row is missing for {run_id}")
+        if str(row.get("status")) == contract:
+            return
+        moved = self._durable_store.transition(run_id, RunState(contract))
+        if moved:
+            return
+        verified = self._durable_store.get_run(run_id)
+        if verified is None or str(verified.get("status")) != contract:
+            raise RuntimeError(
+                f"durable status transition failed for {run_id}: "
+                f"{row.get('status')} -> {contract}"
+            )
 
     def reconcile_durable_runs(self) -> int:
         """V2.8 (contract row 7): reconcile phantom in-flight runs on startup.
@@ -4916,22 +5034,30 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         if not self._broker_enabled():
             return 0
-        try:
-            from gateway.durable_runs import RunState
+        from gateway.durable_runs import RunState
 
-            reconciled = 0
-            for row in self._durable_store.list_non_terminal_runs():
-                if self._durable_store.transition(row["run_id"], RunState.STOPPED):
-                    reconciled += 1
-            if reconciled:
-                logger.info(
-                    "[api_server] reconciled %d phantom run(s) to stopped on startup",
-                    reconciled,
-                )
-            return reconciled
-        except Exception:
-            logger.exception("[api_server] reconcile_durable_runs failed")
-            return 0
+        reconciled = 0
+        for row in self._durable_store.list_non_terminal_runs():
+            event = {
+                "event": "run.stopped",
+                "run_id": row["run_id"],
+                "reason": "startup_reconcile",
+                "timestamp": time.time(),
+            }
+            record = self._durable_store.finalize_run(
+                row["run_id"],
+                terminal_state=RunState.STOPPED,
+                event_type="run.stopped",
+                event_payload=event,
+            )
+            if record is not None:
+                reconciled += 1
+        if reconciled:
+            logger.info(
+                "[api_server] reconciled %d phantom run(s) to stopped on startup",
+                reconciled,
+            )
+        return reconciled
 
     @staticmethod
     def _sse_frame(event: Dict[str, Any]) -> bytes:
@@ -4941,80 +5067,87 @@ class APIServerAdapter(BasePlatformAdapter):
         head = f"id: {seq}\nevent: {event_type}\n" if seq is not None else f"event: {event_type}\n"
         return f"{head}data: {json.dumps(event)}\n\n".encode()
 
-    def _record_run_outcome(
+    def _run_outcome_evidence(
+        self,
+        *,
+        agent: Optional[Any] = None,
+        provider_response_receipt: Optional[Dict[str, Any]] = None,
+    ) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """Build actual policy only from a real provider response receipt."""
+        if agent is None or not isinstance(provider_response_receipt, dict):
+            return None, None
+        receipt_model = provider_response_receipt.get("model")
+        receipt_provider = provider_response_receipt.get("provider")
+        actual_model = (
+            receipt_model
+            if isinstance(receipt_model, str) and receipt_model
+            else None
+        )
+        actual_provider = (
+            receipt_provider
+            if isinstance(receipt_provider, str) and receipt_provider
+            else None
+        )
+        fallback_activated = (
+            getattr(agent, "_fallback_activated", False) is True
+            and actual_model is not None
+        )
+        actual_policy: Dict[str, Any] = {}
+        if actual_model is not None:
+            actual_policy["model"] = actual_model
+        if actual_provider is not None:
+            actual_policy["provider"] = actual_provider
+
+        fallback_reason: Optional[str] = None
+        if fallback_activated:
+            fallback_reason = f"fallback_activated:{actual_model}"
+            if actual_provider:
+                fallback_reason = (
+                    f"fallback_activated:{actual_model} via {actual_provider}"
+                )
+        return actual_policy or None, fallback_reason
+
+    def _finalize_durable_run(
         self,
         run_id: str,
         *,
-        route: Optional[Dict[str, Any]],
-        fallback_model: Optional[str],
-        usage: Optional[Dict[str, Any]],
+        upstream_status: str,
+        event: Dict[str, Any],
+        outcome_usage: Optional[Dict[str, Any]],
         agent: Optional[Any] = None,
+        provider_response_receipt: Optional[Dict[str, Any]] = None,
+        **status_fields: Any,
     ) -> None:
-        """V2.6/V2.6b (contract row 5): persist ACTUAL provider/model + usage + fallback.
+        """Atomically finalize canonical truth, then project/fan out it."""
+        from gateway.durable_runs import RunState
 
-        Never touches requested_policy. Best-effort: storage failure must not
-        mask the run's terminal transition.
-
-        V2.6b: prefer the live agent's post-run model/provider (mutated in-place
-        on fallback via ``agent._fallback_activated``) over the pre-run route /
-        advertised default. A real fallback stamps a non-empty
-        ``fallback_reason``; a bare MagicMock agent (no real string attrs) is
-        never treated as a fallback.
-        """
-        if not self._broker_enabled():
-            return
+        contract = self._STATUS_TO_RUNSTATE[upstream_status]
+        actual_policy, fallback_reason = self._run_outcome_evidence(
+            agent=agent,
+            provider_response_receipt=provider_response_receipt,
+        )
         try:
-            # Prefer the live agent's post-run route. AIAgent mutates
-            # agent.model/provider in-place on fallback and sets
-            # _fallback_activated=True (chat_completion_helpers.py /
-            # agent_init.py). Require real strings + a literal True so a bare
-            # MagicMock (bool(MagicMock()) is True; attrs are MagicMocks) never
-            # fabricates a fallback.
-            agent_model = getattr(agent, "model", None) if agent is not None else None
-            agent_provider = getattr(agent, "provider", None) if agent is not None else None
-            agent_model_s = agent_model if isinstance(agent_model, str) and agent_model else None
-            agent_provider_s = (
-                agent_provider if isinstance(agent_provider, str) and agent_provider else None
-            )
-            fallback_activated = (
-                agent is not None
-                and getattr(agent, "_fallback_activated", False) is True
-                and agent_model_s is not None
-            )
-
-            actual_policy: Dict[str, Any] = {}
-            if agent_model_s is not None:
-                actual_policy["model"] = agent_model_s
-            elif route and route.get("model"):
-                actual_policy["model"] = route.get("model")
-            elif self._model_name:
-                actual_policy["model"] = self._model_name
-            if agent_provider_s is not None:
-                actual_policy["provider"] = agent_provider_s
-            elif route and route.get("provider"):
-                actual_policy["provider"] = route.get("provider")
-            if fallback_model:
-                # The configured authorized chain (for audit); not which entry fired.
-                actual_policy["fallback_model"] = fallback_model
-
-            fallback_reason: Optional[str] = None
-            if fallback_activated:
-                # Reason names the activated model so a consumer can distinguish
-                # "which entry of the authorized chain served this run".
-                fallback_reason = f"fallback_activated:{agent_model_s}"
-                if agent_provider_s:
-                    fallback_reason = (
-                        f"fallback_activated:{agent_model_s} via {agent_provider_s}"
-                    )
-
-            self._durable_store.record_run_outcome(
+            record = self._durable_store.finalize_run(
                 run_id,
-                actual_policy=actual_policy or None,
+                terminal_state=RunState(contract),
+                event_type=str(event["event"]),
+                event_payload=dict(event),
+                actual_policy=actual_policy,
                 fallback_reason=fallback_reason,
-                usage=usage,
+                usage=outcome_usage,
             )
         except Exception:
-            logger.exception("[api_server] record_run_outcome failed for %s", run_id)
+            self._run_authority_unavailable.add(run_id)
+            raise
+        self._run_authority_unavailable.discard(run_id)
+        if record is not None:
+            self._broker_fanout_record(record)
+        self._update_run_status_memory(
+            run_id, upstream_status, **status_fields
+        )
+        self._broker_publish(run_id, None)
+        self._run_streams.pop(run_id, None)
+        self._run_streams_created.pop(run_id, None)
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
@@ -5025,10 +5158,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 last_event=event.get("event"),
             )
             if self._broker_enabled():
-                try:
-                    loop.call_soon_threadsafe(self._broker_publish, run_id, event)
-                except Exception:
-                    pass
+                def _publish() -> None:
+                    try:
+                        self._broker_publish(run_id, event)
+                    except RuntimeError:
+                        # _broker_publish already interrupted the run. Avoid an
+                        # unhandled event-loop callback while the executor unwinds.
+                        pass
+
+                loop.call_soon_threadsafe(_publish)
                 return
             q = self._run_streams.get(run_id)
             if q is None:
@@ -5142,12 +5280,14 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
+        resolved_session_id = body.get("session_id") or stored_session_id
+
         # V2.2 (contract matrix §2 rows 1/2): honor the caller's Idempotency-Key
         # with a durable submit-or-get against the canonical request digest.
         # Same identity (key + same semantic body) ⇒ recover the SAME Run without
         # re-executing; same key with a different digest ⇒ 409 (fail closed). When
-        # no key is supplied, or no durable store is configured, behavior is
-        # unchanged (a fresh run is minted below).
+        # no key is supplied, or no durable store is configured, a fresh run is
+        # still minted below.
         idempotency_key = request.headers.get("Idempotency-Key") or None
         if idempotency_key is not None:
             idempotency_key = idempotency_key.strip() or None
@@ -5166,6 +5306,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 submit = self._durable_store.submit_or_get(
                     idempotency_key=idempotency_key,
                     request_body=body,
+                    session_id=resolved_session_id,
                 )
             except ConflictError:
                 return web.json_response(
@@ -5175,6 +5316,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     ),
                     status=409,
                 )
+            except Exception:
+                logger.exception("[api_server] durable submit_or_get failed")
+                return web.json_response(
+                    _openai_error(
+                        "Durable run authority is unavailable; retry later",
+                        code="durable_unavailable",
+                    ),
+                    status=503,
+                    headers={"Retry-After": "1"},
+                )
             if not submit.created:
                 # Recovery: return the existing Run; never re-spawn it.
                 response_headers = (
@@ -5182,36 +5333,97 @@ class APIServerAdapter(BasePlatformAdapter):
                     if gateway_session_key
                     else {}
                 )
-                return web.json_response(
-                    {
+                try:
+                    stored_run = self._durable_store.get_run(submit.run_id)
+                except Exception:
+                    logger.exception(
+                        "[api_server] durable replay lookup failed for %s",
+                        submit.run_id,
+                    )
+                    return self._durable_unavailable_response()
+                if stored_run is None:
+                    return self._durable_unavailable_response()
+                try:
+                    replay_body = self._public_run_status({
                         "run_id": submit.run_id,
-                        "status": "recovered",
+                        "status": stored_run.get("status"),
                         "idempotent_replay": True,
                         "idempotency_key": idempotency_key,
-                    },
+                    })
+                except ValueError:
+                    return self._run_state_invalid_response(submit.run_id)
+                return web.json_response(
+                    replay_body,
                     status=202,
                     headers=response_headers,
                 )
             run_id = submit.run_id
-            session_id = body.get("session_id") or stored_session_id or run_id
+            session_id = resolved_session_id or run_id
         else:
             run_id = f"run_{uuid.uuid4().hex}"
-            session_id = body.get("session_id") or stored_session_id or run_id
+            session_id = resolved_session_id or run_id
         # Ensure a durable run row exists whenever the broker is active so
         # events/approvals have a parent (contract row 9). Keyed submissions were
         # already persisted by submit_or_get; this registers server-minted runs.
-        # Never block a run on storage failure.
+        # Durable mode is fail-closed: no agent may start without its canonical
+        # run row. Keyed submit_or_get already created that row; server-minted
+        # runs must register it here before any transport/task state exists.
         if self._broker_enabled():
             try:
-                self._durable_store.register_run(
-                    run_id=run_id,
-                    session_id=session_id,
-                    idempotency_key=idempotency_key,
-                    request_body=body,
-                )
-                self._broker_seed(run_id)
+                if idempotency_key is None:
+                    self._durable_store.register_run(
+                        run_id=run_id,
+                        session_id=session_id,
+                        request_body=body,
+                    )
             except Exception:
                 logger.exception("[api_server] durable register_run failed for %s", run_id)
+                return web.json_response(
+                    _openai_error(
+                        "Durable run authority is unavailable; retry later",
+                        code="durable_unavailable",
+                    ),
+                    status=503,
+                    headers={"Retry-After": "1"},
+                )
+
+        # Resolve the requested route and persist it before creating any live
+        # task/transport state. A run without immutable requested-policy
+        # evidence is not admitted to provider execution.
+        route = self._resolve_route(body.get("model"))
+        if self._broker_enabled():
+            requested_policy: Dict[str, Any] = {}
+            if body.get("model") is not None:
+                requested_policy["model"] = body.get("model")
+            if route:
+                requested_policy["route"] = {
+                    key: route[key]
+                    for key in ("model", "provider")
+                    if route.get(key) is not None
+                }
+            try:
+                policy_recorded = self._durable_store.set_requested_policy(
+                    run_id, requested_policy
+                )
+            except Exception:
+                logger.exception(
+                    "[api_server] set_requested_policy failed for %s", run_id
+                )
+                self._stop_unadmitted_durable_run(run_id)
+                return self._durable_unavailable_response()
+            if not policy_recorded:
+                logger.error(
+                    "[api_server] requested policy was not accepted for %s", run_id
+                )
+                self._stop_unadmitted_durable_run(run_id)
+                return self._durable_unavailable_response()
+            try:
+                self._broker_seed(run_id)
+            except Exception:
+                logger.exception("[api_server] durable broker seed failed for %s", run_id)
+                self._stop_unadmitted_durable_run(run_id)
+                return self._durable_unavailable_response()
+
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
         # conversation/memory scopes, not authorization namespaces: multiple
@@ -5239,6 +5451,13 @@ class APIServerAdapter(BasePlatformAdapter):
             if self._run_streams.get(run_id) is q:
                 q.put_nowait(event)
 
+        def _put_callback_event_if_active(event: Dict) -> None:
+            try:
+                _put_event_if_active(event)
+            except RuntimeError:
+                # Persistence failure already interrupts the active agent.
+                pass
+
         # Also wire stream_delta_callback so message.delta events flow through.
         def _text_cb(delta: Optional[str]) -> None:
             if delta is None:
@@ -5246,7 +5465,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if run_id not in self._run_streams:
                 return
             try:
-                loop.call_soon_threadsafe(_put_event_if_active, {
+                loop.call_soon_threadsafe(_put_callback_event_if_active, {
                     "event": "message.delta",
                     "run_id": run_id,
                     "timestamp": time.time(),
@@ -5255,55 +5474,82 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
-        self._set_run_status(
-            run_id,
-            "queued",
-            created_at=created_at,
-            session_id=session_id,
-            model=body.get("model", self._model_name),
-        )
+        try:
+            self._set_run_status(
+                run_id,
+                "queued",
+                created_at=created_at,
+                session_id=session_id,
+                model=body.get("model", self._model_name),
+            )
+        except Exception:
+            if not self._broker_enabled():
+                raise
+            logger.exception(
+                "[api_server] initial durable status failed for %s", run_id
+            )
+            self._stop_unadmitted_durable_run(run_id)
+            # No task exists yet. Remove every live/transport projection so a
+            # rejected submission cannot remain as a phantom queued run.
+            self._run_streams.pop(run_id, None)
+            self._run_streams_created.pop(run_id, None)
+            self._run_approval_sessions.pop(run_id, None)
+            self._run_statuses.pop(run_id, None)
+            self._run_event_seq.pop(run_id, None)
+            self._run_event_subscribers.pop(run_id, None)
+            self._run_event_terminal.discard(run_id)
+            self._active_run_agents.pop(run_id, None)
+            self._active_run_tasks.pop(run_id, None)
+            self._stopping_run_ids.discard(run_id)
+            self._stop_intent_run_ids.discard(run_id)
+            return self._durable_unavailable_response()
 
-        # Per-client model routing for /v1/runs (see model_routes).
-        route = self._resolve_route(body.get("model"))
-        # V2.6 (contract row 5): record the REQUESTED policy once at submission.
-        # The requested route is immutable — later actual-route recording never
-        # overwrites it. Never block a run on storage failure.
-        if self._broker_enabled():
-            try:
-                requested_policy: Dict[str, Any] = {}
-                if body.get("model") is not None:
-                    requested_policy["model"] = body.get("model")
-                if route:
-                    requested_policy["route"] = {
-                        k: v for k, v in route.items() if k not in {"api_key"}
-                    }
-                self._durable_store.set_requested_policy(run_id, requested_policy)
-            except Exception:
-                logger.exception("[api_server] set_requested_policy failed for %s", run_id)
         # Background task outlives the HTTP response (and thus the middleware
         # profile scope). Capture now and re-enter inside the task/executor.
         request_profile = _api_request_profile.get()
-        # Resolve the fallback chain once for evidence (V2.6); _create_agent
-        # re-resolves it for the agent itself. Best-effort.
-        try:
-            from gateway.run import GatewayRunner as _GR
-
-            fallback_model = _GR._load_fallback_model()
-        except Exception:
-            fallback_model = None
-
         async def _run_and_close():
+            provider_evidence: Dict[str, Optional[Dict[str, Any]]] = {
+                "attempt": None,
+                "response": None,
+            }
+
+            def _finish(
+                upstream_status: str,
+                event: Dict[str, Any],
+                *,
+                final_usage: Optional[Dict[str, Any]],
+                final_agent: Optional[Any],
+                **status_fields: Any,
+            ) -> None:
+                if self._broker_enabled():
+                    self._finalize_durable_run(
+                        run_id,
+                        upstream_status=upstream_status,
+                        event=event,
+                        outcome_usage=final_usage,
+                        agent=final_agent,
+                        provider_response_receipt=provider_evidence["response"],
+                        **status_fields,
+                    )
+                else:
+                    _put_event_if_active(event)
+                    self._set_run_status(
+                        run_id, upstream_status, **status_fields
+                    )
+
             try:
                 self._set_run_status(run_id, "running")
                 if run_id in self._stopping_run_ids:
-                    _put_event_if_active({
+                    cancelled = {
                         "event": "run.cancelled",
                         "run_id": run_id,
                         "timestamp": time.time(),
-                    })
-                    self._set_run_status(
-                        run_id,
+                    }
+                    _finish(
                         "cancelled",
+                        cancelled,
+                        final_usage=None,
+                        final_agent=None,
                         last_event="run.cancelled",
                     )
                     return
@@ -5318,39 +5564,95 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 self._active_run_agents[run_id] = agent
 
+                def _record_provider_attempt(attempt: Dict[str, Any]) -> None:
+                    # A new attempt invalidates any older response receipt. If
+                    # this attempt fails before a response, public actual-policy
+                    # evidence must remain empty rather than naming a stale
+                    # primary/fallback route.
+                    provider_evidence["attempt"] = dict(attempt)
+                    provider_evidence["response"] = None
+
+                def _record_provider_response(receipt: Dict[str, Any]) -> None:
+                    provider_evidence["response"] = dict(receipt)
+
+                agent._provider_attempt_callback = _record_provider_attempt
+                agent._provider_response_callback = _record_provider_response
+
+                # Stop can be accepted while agent construction is in flight,
+                # after the earlier admission check but before provider work.
+                # Recheck after publishing the live agent ref and immediately
+                # before run_conversation so an accepted stop wins this window.
+                if run_id in self._stopping_run_ids:
+                    try:
+                        agent.interrupt("Stop requested before provider dispatch")
+                    except Exception:
+                        pass
+                    cancelled = {
+                        "event": "run.cancelled",
+                        "run_id": run_id,
+                        "timestamp": time.time(),
+                    }
+                    _finish(
+                        "cancelled",
+                        cancelled,
+                        final_usage=None,
+                        final_agent=agent,
+                        last_event="run.cancelled",
+                    )
+                    return
+
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
                     event = dict(approval_data or {})
-                    # Redact credentials from the command before it enters the
-                    # SSE/API event stream — same egress bug as #48456, second
-                    # transport: API/desktop clients would otherwise receive the
-                    # raw command Tirith flagged. Reuse the gateway seam.
-                    if "command" in event:
-                        from gateway.run import _redact_approval_command
+                    # Final API egress redaction covers every human-facing text
+                    # field, including MCP elicitation descriptions/previews.
+                    from gateway.run import _redact_approval_command
 
-                        event["command"] = _redact_approval_command(event.get("command"))
+                    redacted_command = _redact_approval_command(event.get("command"))
+                    event["command"] = redacted_command
+                    for field in ("description", "preview", "target"):
+                        if field in event:
+                            event[field] = redact_sensitive_text(
+                                str(event[field]), force=True
+                            )
+                    # Guard-pattern keys are server-internal authorization
+                    # identifiers.  The action digest binds them inside the
+                    # approval core; Web/SSE clients neither need nor receive
+                    # their raw values.
+                    event.pop("pattern_key", None)
+                    event.pop("pattern_keys", None)
                     # V2.7 (contract row 6): issue an exact durable challenge bound
                     # to this run + a canonical digest of the gated action. The
                     # client must echo challenge_id + action_digest back to consume
                     # (single-use + TTL + CAS). Broker-only; legacy path unchanged.
                     if self._broker_enabled():
-                        action_digest = canonical_digest({
-                            "command": event.get("command"),
-                            "description": event.get("description"),
-                            "pattern_keys": event.get("pattern_keys"),
-                        })
+                        approval_id = str(event.get("approval_id") or "")
+                        action_digest = str(event.get("action_digest") or "")
                         try:
+                            if not approval_id or not action_digest:
+                                raise ValueError(
+                                    "approval core did not provide exact approval identity"
+                                )
                             ch = self._durable_store.issue_approval_challenge(
                                 run_id,
+                                approval_id=approval_id,
                                 action_digest=action_digest,
                                 ttl_seconds=self._APPROVAL_CHALLENGE_TTL,
                             )
                             event["challenge_id"] = ch.challenge_id
+                            event["approval_id"] = ch.approval_id
                             event["action_digest"] = action_digest
                             event["expires_at"] = ch.expires_at
-                        except Exception:
+                        except Exception as exc:
                             logger.exception(
                                 "[api_server] issue_approval_challenge failed for %s", run_id
                             )
+                            # Propagate into _await_gateway_decision: it removes
+                            # the queue entry and returns notify_failed/deny.  An
+                            # unanswerable request must never be published or
+                            # move the run into waiting_for_approval.
+                            raise RuntimeError(
+                                "durable approval challenge unavailable"
+                            ) from exc
                     event.update({
                         "event": "approval.request",
                         "run_id": run_id,
@@ -5395,6 +5697,11 @@ class APIServerAdapter(BasePlatformAdapter):
                                 session_key=approval_session_key,
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
+                            if run_id in self._stopping_run_ids:
+                                return {
+                                    "final_response": "",
+                                    "stopped_before_provider_dispatch": True,
+                                }, None
                             r = agent.run_conversation(
                                 user_message=user_message,
                                 conversation_history=conversation_history,
@@ -5414,23 +5721,30 @@ class APIServerAdapter(BasePlatformAdapter):
                                         clear_session_vars(session_tokens)
                                     except Exception:
                                         pass
-                        u = {
-                            "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                            "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                            "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-                        }
+                        if provider_evidence["response"] is None:
+                            u = None
+                        else:
+                            u = {
+                                "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                                "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                                "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                            }
                         return r, u
 
-                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                result, usage = await asyncio.get_running_loop().run_in_executor(
+                    None, _run_sync
+                )
                 if run_id in self._stopping_run_ids:
-                    _put_event_if_active({
+                    cancelled = {
                         "event": "run.cancelled",
                         "run_id": run_id,
                         "timestamp": time.time(),
-                    })
-                    self._set_run_status(
-                        run_id,
+                    }
+                    _finish(
                         "cancelled",
+                        cancelled,
+                        final_usage=usage,
+                        final_agent=agent,
                         last_event="run.cancelled",
                     )
                 # Check for structured failure (non-retryable client errors like
@@ -5438,94 +5752,79 @@ class APIServerAdapter(BasePlatformAdapter):
                 # block below never fires — issue #15561).
                 elif isinstance(result, dict) and result.get("failed"):
                     error_msg = _redact_api_error_text(result.get("error") or "agent run failed")
-                    _put_event_if_active({
+                    failed_event = {
                         "event": "run.failed",
                         "run_id": run_id,
                         "timestamp": time.time(),
                         "error": error_msg,
-                    })
-                    self._record_run_outcome(
-                        run_id,
-                        route=route,
-                        fallback_model=fallback_model,
-                        usage=usage,
-                        agent=agent,
-                    )
-                    self._set_run_status(
-                        run_id,
+                    }
+                    _finish(
                         "failed",
+                        failed_event,
+                        final_usage=usage,
+                        final_agent=agent,
                         error=error_msg,
                         last_event="run.failed",
                     )
                 else:
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
-                    _put_event_if_active({
+                    completed_event = {
                         "event": "run.completed",
                         "run_id": run_id,
                         "timestamp": time.time(),
                         "output": final_response,
                         "usage": usage,
-                    })
-                    self._record_run_outcome(
-                        run_id,
-                        route=route,
-                        fallback_model=fallback_model,
-                        usage=usage,
-                        agent=agent,
-                    )
-                    self._set_run_status(
-                        run_id,
+                    }
+                    _finish(
                         "completed",
+                        completed_event,
+                        final_usage=usage,
+                        final_agent=agent,
                         output=final_response,
                         usage=usage,
                         last_event="run.completed",
                     )
             except asyncio.CancelledError:
-                self._record_run_outcome(
-                    run_id,
-                    route=route,
-                    fallback_model=fallback_model,
-                    usage=None,
-                    agent=locals().get("agent"),
-                )
-                self._set_run_status(
-                    run_id,
-                    "cancelled",
-                    last_event="run.cancelled",
-                )
                 try:
-                    _put_event_if_active({
+                    cancelled = {
                         "event": "run.cancelled",
                         "run_id": run_id,
                         "timestamp": time.time(),
-                    })
+                    }
+                    _finish(
+                        "cancelled",
+                        cancelled,
+                        final_usage=None,
+                        final_agent=locals().get("agent"),
+                        last_event="run.cancelled",
+                    )
                 except Exception:
-                    pass
+                    logger.exception(
+                        "[api_server] cancelled run %s could not finalize", run_id
+                    )
                 raise
             except Exception as exc:
                 logger.exception("[api_server] run %s failed", run_id)
-                self._record_run_outcome(
-                    run_id,
-                    route=route,
-                    fallback_model=fallback_model,
-                    usage=None,
-                    agent=locals().get("agent"),
-                )
-                self._set_run_status(
-                    run_id,
-                    "failed",
-                    error=_redact_api_error_text(exc),
-                    last_event="run.failed",
-                )
                 try:
-                    _put_event_if_active({
+                    error_text = _redact_api_error_text(exc)
+                    failed_event = {
                         "event": "run.failed",
                         "run_id": run_id,
                         "timestamp": time.time(),
-                        "error": _redact_api_error_text(exc),
-                    })
+                        "error": error_text,
+                    }
+                    _finish(
+                        "failed",
+                        failed_event,
+                        final_usage=None,
+                        final_agent=locals().get("agent"),
+                        error=error_text,
+                        last_event="run.failed",
+                    )
                 except Exception:
-                    pass
+                    logger.exception(
+                        "[api_server] failed run %s could not finalize", run_id
+                    )
             finally:
                 # If the asyncio wrapper is cancelled (for example via
                 # /stop), the executor thread can still be blocked waiting
@@ -5543,10 +5842,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     _put_event_if_active(None)
                 except Exception:
                     pass
+                # Durable subscribers replay from canonical storage, so their
+                # live ownership can be dropped immediately.  Preserve the
+                # legacy in-memory terminal queue until its SSE consumer/TTL
+                # sweep observes the sentinel.
+                if self._broker_enabled():
+                    self._run_streams.pop(run_id, None)
+                    self._run_streams_created.pop(run_id, None)
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
+                self._stop_intent_run_ids.discard(run_id)
 
         self._activate_admitted_request()
         task = asyncio.create_task(_run_and_close())
@@ -5562,7 +5869,7 @@ class APIServerAdapter(BasePlatformAdapter):
             {"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {}
         )
         return web.json_response(
-            {"run_id": run_id, "status": "started"},
+            {"run_id": run_id, "status": "queued"},
             status=202,
             headers=response_headers,
         )
@@ -5575,12 +5882,42 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = request.match_info["run_id"]
         status = self._run_statuses.get(run_id)
+        if run_id in self._run_authority_unavailable:
+            if not self._broker_enabled():
+                self._run_authority_unavailable.discard(run_id)
+            else:
+                try:
+                    recovery_row = self._durable_store.get_run(run_id)
+                except Exception:
+                    return self._durable_unavailable_response()
+                if recovery_row is None or str(recovery_row.get("status")) not in {
+                    "succeeded", "failed", "stopped"
+                }:
+                    return self._durable_unavailable_response()
+                self._run_authority_unavailable.discard(run_id)
         if status is None:
             # V2.6: fall back to the durable store so evidence survives restart.
             if self._broker_enabled():
-                row = self._durable_store.get_run(run_id)
+                try:
+                    row = self._durable_store.get_run(run_id)
+                except Exception:
+                    logger.exception(
+                        "[api_server] durable run lookup failed for %s", run_id
+                    )
+                    return self._durable_unavailable_response()
                 if row is not None:
-                    return web.json_response(self._run_status_from_store(row))
+                    try:
+                        projected = self._public_run_status(
+                            self._run_status_from_store(row)
+                        )
+                    except DurableEvidenceError:
+                        logger.exception(
+                            "[api_server] durable evidence is corrupt for %s", run_id
+                        )
+                        return self._durable_unavailable_response()
+                    except ValueError:
+                        return self._run_state_invalid_response(run_id)
+                    return web.json_response(projected)
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
                 status=404,
@@ -5588,32 +5925,55 @@ class APIServerAdapter(BasePlatformAdapter):
         if self._broker_enabled():
             # Merge durable evidence (requested/actual/usage/fallback) into the
             # in-memory status without mutating the live dict.
-            row = self._durable_store.get_run(run_id)
-            if row is not None:
-                status = {**status, **self._evidence_from_row(row)}
-        return web.json_response(status)
+            try:
+                row = self._durable_store.get_run(run_id)
+            except Exception:
+                logger.exception(
+                    "[api_server] durable evidence lookup failed for %s", run_id
+                )
+                return self._durable_unavailable_response()
+            if row is None:
+                return self._durable_unavailable_response()
+            # Canonical durable lifecycle wins over a stale live projection;
+            # retain only additive live fields such as output/error.
+            try:
+                status = {**status, **self._run_status_from_store(row)}
+            except DurableEvidenceError:
+                logger.exception(
+                    "[api_server] durable evidence is corrupt for %s", run_id
+                )
+                return self._durable_unavailable_response()
+        try:
+            projected = self._public_run_status(status)
+        except ValueError:
+            return self._run_state_invalid_response(run_id)
+        return web.json_response(projected)
 
     @staticmethod
     def _evidence_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
         """Project durable runs-row evidence columns onto the status response."""
         out: Dict[str, Any] = {}
-        if row.get("requested_policy"):
+        for column, public_name in (
+            ("requested_policy", "requested_policy"),
+            ("actual_policy", "actual_policy"),
+            ("usage_json", "usage"),
+        ):
+            raw = row.get(column)
+            if not raw:
+                continue
             try:
-                out["requested_policy"] = json.loads(row["requested_policy"])
-            except (TypeError, ValueError):
-                pass
-        if row.get("actual_policy"):
-            try:
-                out["actual_policy"] = json.loads(row["actual_policy"])
-            except (TypeError, ValueError):
-                pass
+                decoded = json.loads(raw)
+            except (TypeError, ValueError) as exc:
+                raise DurableEvidenceError(
+                    f"invalid durable evidence JSON in {column}"
+                ) from exc
+            if not isinstance(decoded, dict):
+                raise DurableEvidenceError(
+                    f"durable evidence {column} must be a JSON object"
+                )
+            out[public_name] = decoded
         if row.get("fallback_reason") is not None:
             out["fallback_reason"] = row["fallback_reason"]
-        if row.get("usage_json"):
-            try:
-                out["usage"] = json.loads(row["usage_json"])
-            except (TypeError, ValueError):
-                pass
         return out
 
     def _run_status_from_store(self, row: Dict[str, Any]) -> Dict[str, Any]:
@@ -5706,19 +6066,53 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=400,
                 )
 
-        terminal = self._broker_is_terminal(run_id)
+        if run_id in self._run_authority_unavailable:
+            return self._durable_unavailable_response()
+
+        try:
+            durable_run = self._durable_store.get_run(run_id)
+        except Exception:
+            logger.exception(
+                "[api_server] durable SSE run lookup failed for %s", run_id
+            )
+            return self._durable_unavailable_response()
+
+        if durable_run is None and (
+            run_id in self._run_event_subscribers
+            or run_id in self._run_streams
+            or run_id in self._run_statuses
+        ):
+            # Live transport without its canonical parent is corruption, not a
+            # normal pre-registration race.
+            return self._durable_unavailable_response()
+
+        terminal = self._broker_is_terminal(run_id) or bool(
+            durable_run
+            and str(durable_run.get("status")) in {"succeeded", "failed", "stopped"}
+        )
         known = (
             terminal
             or run_id in self._run_event_subscribers
             or run_id in self._run_streams
             or run_id in self._run_statuses
-            or (self._durable_store.get_run(run_id) is not None)
+            or durable_run is not None
         )
         if not known:
             # Allow subscribing slightly before the run is registered (race window).
             for _ in range(20):
-                if run_id in self._run_statuses or self._durable_store.get_run(run_id):
+                try:
+                    durable_run = self._durable_store.get_run(run_id)
+                except Exception:
+                    logger.exception(
+                        "[api_server] durable SSE registration lookup failed for %s",
+                        run_id,
+                    )
+                    return self._durable_unavailable_response()
+                if durable_run is not None:
                     known = True
+                    terminal = str(durable_run.get("status")) in {
+                        "succeeded", "failed", "stopped"
+                    }
                     break
                 await asyncio.sleep(0.05)
             if not known:
@@ -5727,17 +6121,30 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=404,
                 )
 
+        # Subscribe before reading the durable backlog. Events committed while
+        # replay is in progress are then both durable and queued; ``last_sent``
+        # below removes the intentional overlap without opening a gap.
+        live_q = None
+        if not terminal:
+            live_q = self._broker_subscribe(run_id)
+            self._run_stream_subscribers.add(run_id)
+
         # Durable backlog strictly after the cursor (no gap, no dup).
         try:
             backlog = self._durable_store.replay_events(run_id, since_seq=cursor)
         except Exception:
             logger.exception("[api_server] durable replay failed for run %s", run_id)
-            backlog = []
-
-        live_q = None
-        if not terminal:
-            live_q = self._broker_subscribe(run_id)
-            self._run_stream_subscribers.add(run_id)
+            if live_q is not None:
+                self._broker_unsubscribe(run_id, live_q)
+            self._run_stream_subscribers.discard(run_id)
+            return web.json_response(
+                _openai_error(
+                    "Durable event replay is unavailable; retry later",
+                    code="durable_unavailable",
+                ),
+                status=503,
+                headers={"Retry-After": "1"},
+            )
 
         response = web.StreamResponse(
             status=200,
@@ -5755,7 +6162,12 @@ class APIServerAdapter(BasePlatformAdapter):
             for rec in backlog:
                 if rec.seq <= last_sent:
                     continue  # belt-and-suspenders: no duplicate across the seam
-                frame = {"seq": rec.seq, "event": rec.event_type, **rec.payload}
+                frame = {
+                    **rec.payload,
+                    "seq": rec.seq,
+                    "event": rec.event_type,
+                    "event_id": rec.event_id,
+                }
                 await response.write(self._sse_frame(frame))
                 last_sent = rec.seq
 
@@ -5800,14 +6212,26 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = request.match_info["run_id"]
         status = self._run_statuses.get(run_id)
-        if status is None:
-            # After restart the live map may be empty while the durable row (and
-            # any outstanding grant) still exists. Do not 404 solely on memory.
-            if not (self._broker_enabled() and self._durable_store.get_run(run_id) is not None):
+        if self._broker_enabled():
+            try:
+                durable_run = self._durable_store.get_run(run_id)
+            except Exception:
+                logger.exception(
+                    "[api_server] durable approval run lookup failed for %s", run_id
+                )
+                return self._durable_unavailable_response()
+            if durable_run is None:
+                if status is not None:
+                    return self._durable_unavailable_response()
                 return web.json_response(
                     _openai_error(f"Run not found: {run_id}", code="run_not_found"),
                     status=404,
                 )
+        elif status is None:
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
 
         try:
             body = await request.json()
@@ -5827,14 +6251,33 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
-        # V2.7 (contract row 6) + A6 fix: validate the exact challenge first, then
-        # require an active pending session, THEN CAS-consume, THEN resolve.
-        # Consuming before resolve burned single-use grants on approval_not_active
-        # / approval_not_pending paths — plan A6 forbids changing the prior fact
-        # on non-success. If resolve still returns 0 after a successful consume
-        # (TOCTOU race), restore the grant so the client can retry.
+        # Validate exact challenge identity before any live queue mutation.
         challenge_id_str: Optional[str] = None
         action_digest_str: Optional[str] = None
+        approval_id_str: Optional[str] = None
+        decision_replay = False
+        response_replay = False
+        release_replay = False
+
+        def _durable_approval_result(
+            waiter_signal_status: str,
+            *,
+            idempotent_replay: bool = False,
+        ) -> "web.Response":
+            payload: Dict[str, Any] = {
+                "object": "hermes.run.approval_response",
+                "run_id": run_id,
+                "choice": choice,
+                "decision_status": "committed",
+                "waiter_signal_status": waiter_signal_status,
+                "challenge_id": challenge_id_str,
+                "approval_id": approval_id_str,
+                "action_digest": action_digest_str,
+            }
+            if idempotent_replay:
+                payload["idempotent_replay"] = True
+            return web.json_response(payload)
+
         if self._broker_enabled():
             challenge_id = body.get("challenge_id")
             action_digest = body.get("action_digest")
@@ -5848,7 +6291,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             challenge_id_str = str(challenge_id)
             action_digest_str = str(action_digest)
-            grant = self._durable_store.get_approval_challenge(challenge_id_str)
+            try:
+                grant = self._durable_store.get_approval_challenge(challenge_id_str)
+            except Exception:
+                logger.exception(
+                    "[api_server] durable approval challenge lookup failed for %s",
+                    run_id,
+                )
+                return self._durable_unavailable_response()
             if grant is None or grant.get("run_id") != run_id:
                 return web.json_response(
                     _openai_error(
@@ -5857,9 +6307,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     ),
                     status=409,
                 )
-            # Pre-flight (no mutate): already used / expired / digest mismatch
-            # must leave the real grant intact and never touch the queue.
-            if grant.get("consumed"):
+            approval_id_str = str(grant.get("approval_id") or "")
+            if not approval_id_str:
+                return web.json_response(
+                    _openai_error(
+                        "Approval challenge is not bound to a pending action",
+                        code="approval_challenge_invalid",
+                    ),
+                    status=409,
+                )
+            if str(grant.get("action_digest") or "") != action_digest_str:
                 return web.json_response(
                     _openai_error(
                         "Approval challenge is stale, expired, already used, or mismatched",
@@ -5867,11 +6324,110 @@ class APIServerAdapter(BasePlatformAdapter):
                     ),
                     status=409,
                 )
+            # An immutable committed decision may recover delivery only for the
+            # exact same choice.  A second/different choice can never rewrite it.
+            if grant.get("consumed"):
+                try:
+                    prior_decision = self._durable_store.get_approval_decision(
+                        challenge_id_str
+                    )
+                except Exception:
+                    logger.exception(
+                        "[api_server] durable approval decision lookup failed for %s",
+                        run_id,
+                    )
+                    return self._durable_unavailable_response()
+                if (
+                    prior_decision is None
+                    or prior_decision.payload.get("approval_id") != approval_id_str
+                    or prior_decision.payload.get("action_digest") != action_digest_str
+                    or prior_decision.payload.get("choice") != choice
+                ):
+                    return web.json_response(
+                        _openai_error(
+                            "Approval challenge already has a different or invalid decision",
+                            code="approval_challenge_invalid",
+                        ),
+                        status=409,
+                    )
+                try:
+                    prior_response = self._durable_store.get_approval_response(
+                        challenge_id_str
+                    )
+                except Exception:
+                    logger.exception(
+                        "[api_server] durable approval response lookup failed for %s",
+                        run_id,
+                    )
+                    return self._durable_unavailable_response()
+                if prior_response is not None:
+                    response_payload = prior_response.payload
+                    if (
+                        response_payload.get("approval_id") != approval_id_str
+                        or response_payload.get("action_digest") != action_digest_str
+                        or response_payload.get("choice") != choice
+                    ):
+                        return web.json_response(
+                            _openai_error(
+                                "Approval response conflicts with the immutable decision",
+                                code="approval_challenge_invalid",
+                            ),
+                            status=409,
+                        )
+                    response_replay = True
+                try:
+                    prior_release = self._durable_store.get_approval_release(
+                        challenge_id_str
+                    )
+                    prior_delivery = self._durable_store.get_approval_delivery(
+                        challenge_id_str
+                    )
+                except Exception:
+                    logger.exception(
+                        "[api_server] durable approval release/signal lookup failed for %s",
+                        run_id,
+                    )
+                    return self._durable_unavailable_response()
+                if prior_release is not None:
+                    release_payload = prior_release.payload
+                    if (
+                        not response_replay
+                        or release_payload.get("approval_id") != approval_id_str
+                        or release_payload.get("action_digest") != action_digest_str
+                        or release_payload.get("choice") != choice
+                    ):
+                        return web.json_response(
+                            _openai_error(
+                                "Approval release conflicts with canonical response",
+                                code="approval_challenge_invalid",
+                            ),
+                            status=409,
+                        )
+                    release_replay = True
+                if prior_delivery is not None:
+                    delivery_payload = prior_delivery.payload
+                    if (
+                        not release_replay
+                        or delivery_payload.get("approval_id") != approval_id_str
+                        or delivery_payload.get("action_digest") != action_digest_str
+                        or delivery_payload.get("choice") != choice
+                    ):
+                        return web.json_response(
+                            _openai_error(
+                                "Approval delivery conflicts with canonical response",
+                                code="approval_challenge_invalid",
+                            ),
+                            status=409,
+                        )
+                    return _durable_approval_result(
+                        "confirmed", idempotent_replay=True
+                    )
+                decision_replay = True
             try:
                 expires_at = float(grant.get("expires_at") or 0.0)
             except (TypeError, ValueError):
                 expires_at = 0.0
-            if expires_at <= time.time() or str(grant.get("action_digest") or "") != action_digest_str:
+            if not decision_replay and expires_at <= time.time():
                 return web.json_response(
                     _openai_error(
                         "Approval challenge is stale, expired, already used, or mismatched",
@@ -5882,6 +6438,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
         approval_session_key = self._run_approval_sessions.get(run_id)
         if not approval_session_key:
+            if self._broker_enabled() and decision_replay:
+                return _durable_approval_result(
+                    "unknown", idempotent_replay=True
+                )
             # Grant NOT consumed — client may retry when session is live again.
             return web.json_response(
                 _openai_error(
@@ -5891,83 +6451,251 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=409,
             )
 
-        from tools.approval import has_blocking_approval, resolve_gateway_approval
+        from tools.approval import (
+            claim_gateway_approval,
+            finalize_gateway_approval_claim,
+            resolve_gateway_approval,
+            restore_gateway_approval_claim,
+        )
 
-        if not has_blocking_approval(approval_session_key):
-            # Nothing pending — do not burn the durable grant.
-            return web.json_response(
-                _openai_error(
-                    f"Run has no pending approval: {run_id}",
-                    code="approval_not_pending",
-                ),
-                status=409,
+        if self._broker_enabled():
+            assert challenge_id_str is not None
+            assert action_digest_str is not None
+            assert approval_id_str is not None
+            # Claim the exact live waiter before burning an immutable durable
+            # decision.  The claim is unsignalled and temporarily suspends its
+            # timeout; every failure below restores it for a safe retry.
+            claim = claim_gateway_approval(
+                approval_session_key, approval_id=approval_id_str
             )
-
-        if self._broker_enabled() and challenge_id_str is not None and action_digest_str is not None:
-            consumed = self._durable_store.consume_approval(
-                challenge_id_str, action_digest=action_digest_str
-            )
-            if not consumed:
+            if claim is None:
+                if decision_replay:
+                    return _durable_approval_result(
+                        "unknown", idempotent_replay=True
+                    )
                 return web.json_response(
                     _openai_error(
-                        "Approval challenge is stale, expired, already used, or mismatched",
-                        code="approval_challenge_invalid",
+                        f"Run has no pending approval: {run_id}",
+                        code="approval_not_pending",
+                    ),
+                    status=409,
+                )
+            if decision_replay:
+                try:
+                    delivery_allowed = self._durable_store.approval_delivery_allowed(
+                        challenge_id_str,
+                        approval_id=approval_id_str,
+                        action_digest=action_digest_str,
+                        choice=choice,
+                    )
+                except Exception:
+                    restore_gateway_approval_claim(approval_session_key, claim)
+                    logger.exception(
+                        "[api_server] durable approval replay fence failed for %s",
+                        run_id,
+                    )
+                    return self._durable_unavailable_response()
+                if not delivery_allowed:
+                    restore_gateway_approval_claim(approval_session_key, claim)
+                    return _durable_approval_result(
+                        "unknown", idempotent_replay=True
+                    )
+            if not decision_replay:
+                try:
+                    decision_record = self._durable_store.consume_approval_with_event(
+                        challenge_id_str,
+                        approval_id=approval_id_str,
+                        action_digest=action_digest_str,
+                        choice=choice,
+                    )
+                except Exception:
+                    restore_gateway_approval_claim(approval_session_key, claim)
+                    logger.exception(
+                        "[api_server] durable approval decision commit failed for %s",
+                        run_id,
+                    )
+                    return self._durable_unavailable_response()
+                if decision_record is None:
+                    restore_gateway_approval_claim(approval_session_key, claim)
+                    return web.json_response(
+                        _openai_error(
+                            "Approval challenge is stale, expired, already used, or mismatched",
+                            code="approval_challenge_invalid",
+                        ),
+                        status=409,
+                    )
+                # Preserve live SSE contiguity: the atomic store helper already
+                # assigned seq/event_id, so fan it out without appending again.
+                self._broker_fanout_record(decision_record)
+            responded_event = {
+                "event": "approval.responded",
+                "run_id": run_id,
+                "challenge_id": challenge_id_str,
+                "approval_id": approval_id_str,
+                "action_digest": action_digest_str,
+                "timestamp": time.time(),
+                "choice": choice,
+                "decision_status": "committed",
+                "waiter_signal_status": "unknown",
+            }
+            if not response_replay:
+                try:
+                    # Persist the human response first. It says nothing about
+                    # the process-local waiter signal.
+                    self._broker_publish(
+                        run_id,
+                        responded_event,
+                        interrupt_on_failure=False,
+                    )
+                except Exception:
+                    restore_gateway_approval_claim(approval_session_key, claim)
+                    logger.exception(
+                        "[api_server] durable approval response commit failed for %s",
+                        run_id,
+                    )
+                    return self._durable_unavailable_response()
+
+            release_event = {
+                "event": "approval.release_committed",
+                "run_id": run_id,
+                "challenge_id": challenge_id_str,
+                "approval_id": approval_id_str,
+                "action_digest": action_digest_str,
+                "timestamp": time.time(),
+                "choice": choice,
+                "decision_status": "committed",
+                "waiter_signal_status": "unknown",
+            }
+
+            def _persist_release_before_signal() -> None:
+                self._broker_publish(
+                    run_id,
+                    release_event,
+                    interrupt_on_failure=False,
+                )
+
+            try:
+                delivered = finalize_gateway_approval_claim(
+                    claim,
+                    choice,
+                    before_signal=(
+                        None if release_replay else _persist_release_before_signal
+                    ),
+                )
+            except Exception:
+                # A durable release commitment is intentionally not signal
+                # proof.  If the exact live Event is still unset, restore the
+                # waiter and report the committed/unknown crash gap.
+                try:
+                    committed_release = self._durable_store.get_approval_release(
+                        challenge_id_str
+                    )
+                except Exception:
+                    committed_release = None
+                if claim.event.is_set():
+                    delivered = True
+                else:
+                    restore_gateway_approval_claim(approval_session_key, claim)
+                    logger.exception(
+                        "[api_server] live approval delivery failed for %s", run_id
+                    )
+                    if committed_release is not None:
+                        return _durable_approval_result(
+                            "unknown", idempotent_replay=decision_replay
+                        )
+                    return self._durable_unavailable_response()
+            if not delivered:
+                restore_gateway_approval_claim(approval_session_key, claim)
+                logger.error(
+                    "[api_server] live approval delivery lost its exact waiter for %s",
+                    run_id,
+                )
+                try:
+                    committed_release = self._durable_store.get_approval_release(
+                        challenge_id_str
+                    )
+                except Exception:
+                    committed_release = None
+                if committed_release is not None:
+                    return _durable_approval_result(
+                        "unknown", idempotent_replay=decision_replay
+                    )
+                return self._durable_unavailable_response()
+
+            signalled_event = {
+                "event": "approval.signalled",
+                "run_id": run_id,
+                "challenge_id": challenge_id_str,
+                "approval_id": approval_id_str,
+                "action_digest": action_digest_str,
+                "timestamp": time.time(),
+                "choice": choice,
+                "decision_status": "committed",
+                "waiter_signal_status": "confirmed",
+            }
+            signal_recorded = False
+            try:
+                self._broker_publish(
+                    run_id,
+                    signalled_event,
+                    interrupt_on_failure=False,
+                )
+                signal_recorded = True
+            except Exception:
+                # Event.set already happened.  Never re-signal on retry; this
+                # request can report its live observation, while a later
+                # restart/replay without approval.signalled must say unknown.
+                logger.exception(
+                    "[api_server] approval signal observation was not persisted for %s",
+                    run_id,
+                )
+            try:
+                self._set_run_status(
+                    run_id,
+                    "running",
+                    last_event=(
+                        "approval.signalled"
+                        if signal_recorded
+                        else "approval.release_committed"
+                    ),
+                )
+            except Exception:
+                logger.exception(
+                    "[api_server] approval signal status refresh failed for %s",
+                    run_id,
+                )
+            return _durable_approval_result("confirmed")
+        else:
+            resolve_all = (
+                _coerce_request_bool(body.get("all"), default=False)
+                or _coerce_request_bool(body.get("resolve_all"), default=False)
+            )
+            try:
+                resolved = resolve_gateway_approval(
+                    approval_session_key, choice, resolve_all=resolve_all
+                )
+            except Exception as exc:
+                logger.exception(
+                    "[api_server] approval resolution failed for run %s", run_id
+                )
+                return web.json_response(_openai_error(str(exc)), status=500)
+            if resolved <= 0:
+                return web.json_response(
+                    _openai_error(
+                        f"Run has no pending approval: {run_id}",
+                        code="approval_not_pending",
                     ),
                     status=409,
                 )
 
-        resolve_all = (
-            _coerce_request_bool(body.get("all"), default=False)
-            or _coerce_request_bool(body.get("resolve_all"), default=False)
-        )
         try:
-            resolved = resolve_gateway_approval(
-                approval_session_key,
-                choice,
-                resolve_all=resolve_all,
+            self._set_run_status(run_id, "running", last_event="approval.responded")
+        except Exception:
+            logger.exception(
+                "[api_server] approval resolved but run status refresh failed for %s",
+                run_id,
             )
-        except Exception as exc:
-            # Resolve blew up after consume — restore grant so retry is possible.
-            if self._broker_enabled() and challenge_id_str is not None:
-                try:
-                    self._durable_store.release_approval_consume(challenge_id_str)
-                except Exception:
-                    logger.exception(
-                        "[api_server] failed to restore approval grant %s after resolve error",
-                        challenge_id_str,
-                    )
-            logger.exception("[api_server] approval resolution failed for run %s", run_id)
-            return web.json_response(_openai_error(str(exc)), status=500)
-
-        if resolved <= 0:
-            # TOCTOU: queue drained between has_blocking_approval and resolve.
-            # Restore the single-use grant — non-success must not change the fact.
-            if self._broker_enabled() and challenge_id_str is not None:
-                try:
-                    self._durable_store.release_approval_consume(challenge_id_str)
-                except Exception:
-                    logger.exception(
-                        "[api_server] failed to restore approval grant %s after resolve=0",
-                        challenge_id_str,
-                    )
-            return web.json_response(
-                _openai_error(
-                    f"Run has no pending approval: {run_id}",
-                    code="approval_not_pending",
-                ),
-                status=409,
-            )
-
-        self._set_run_status(run_id, "running", last_event="approval.responded")
-        if self._broker_enabled():
-            self._broker_publish(run_id, {
-                "event": "approval.responded",
-                "run_id": run_id,
-                "timestamp": time.time(),
-                "choice": choice,
-                "resolved": resolved,
-            })
-        else:
+        if not self._broker_enabled():
             q = self._run_streams.get(run_id)
             if q is not None:
                 try:
@@ -5986,6 +6714,15 @@ class APIServerAdapter(BasePlatformAdapter):
             "run_id": run_id,
             "choice": choice,
             "resolved": resolved,
+            **(
+                {
+                    "challenge_id": challenge_id_str,
+                    "approval_id": approval_id_str,
+                    "action_digest": action_digest_str,
+                }
+                if self._broker_enabled()
+                else {}
+            ),
         })
 
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
@@ -6008,52 +6745,123 @@ class APIServerAdapter(BasePlatformAdapter):
         run_id = request.match_info["run_id"]
         agent = self._active_run_agents.get(run_id)
         task = self._active_run_tasks.get(run_id)
+        durable_row: Optional[Dict[str, Any]] = None
+
+        # Canonical durable terminal truth wins even if stale live refs remain.
+        # Conversely, a live ref with no canonical row is an authority failure.
+        if self._broker_enabled():
+            try:
+                durable_row = self._durable_store.get_run(run_id)
+            except Exception:
+                logger.exception(
+                    "[api_server] durable stop lookup failed for %s", run_id
+                )
+                return self._durable_unavailable_response()
+            if durable_row is None:
+                if agent is not None or task is not None or run_id in self._run_authority_unavailable:
+                    return self._durable_unavailable_response()
+                return web.json_response(
+                    _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                    status=404,
+                )
+            store_status = str(durable_row.get("status") or "")
+            try:
+                projected = self._public_run_status(
+                    {
+                        "run_id": run_id,
+                        "status": store_status,
+                        "idempotent_replay": True,
+                    }
+                )
+            except ValueError:
+                return self._run_state_invalid_response(run_id)
+            if projected["status"] in {"succeeded", "failed", "stopped"}:
+                self._run_authority_unavailable.discard(run_id)
+                return web.json_response(projected)
 
         if agent is None and task is None:
             # No live ref. If the store knows this run, return its actual status
             # (idempotent no-op for terminals; mark-stopped for phantoms).
             if self._broker_enabled():
-                row = self._durable_store.get_run(run_id)
-                if row is not None:
-                    store_status = str(row.get("status") or "")
-                    if store_status in {"succeeded", "failed", "stopped"}:
-                        return web.json_response(
-                            {
-                                "run_id": run_id,
-                                "status": store_status,
-                                "idempotent_replay": True,
-                            }
-                        )
-                    # Non-terminal phantom (no live agent): stop intent lands.
-                    try:
-                        from gateway.durable_runs import RunState
+                assert durable_row is not None
+                if str(durable_row.get("status")) not in {"queued", "running"}:
+                    return self._durable_unavailable_response()
+                try:
+                    from gateway.durable_runs import RunState
 
-                        self._durable_store.transition(
-                            run_id, RunState.STOPPED, strict=False
-                        )
-                    except Exception:
-                        logger.exception(
-                            "[api_server] durable stop transition failed for %s", run_id
-                        )
-                    return web.json_response(
-                        {
+                    self._durable_store.finalize_run(
+                        run_id,
+                        terminal_state=RunState.STOPPED,
+                        event_type="run.stopped",
+                        event_payload={
+                            "event": "run.stopped",
                             "run_id": run_id,
-                            "status": "stopped",
-                            "idempotent_replay": True,
-                        }
+                            "reason": "stop_without_live_task",
+                            "timestamp": time.time(),
+                        },
                     )
-            return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
+                except Exception:
+                    self._run_authority_unavailable.add(run_id)
+                    logger.exception(
+                        "[api_server] durable stop transition failed for %s", run_id
+                    )
+                    return self._durable_unavailable_response()
+                self._run_authority_unavailable.discard(run_id)
+                return web.json_response(
+                    {"run_id": run_id, "status": "stopped", "idempotent_replay": True}
+                )
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
 
-        self._set_run_status(run_id, "stopping", last_event="run.stopping")
+        if self._broker_enabled() and run_id not in self._stop_intent_run_ids:
+            try:
+                self._broker_publish(
+                    run_id,
+                    {
+                        "event": "run.stop_requested",
+                        "run_id": run_id,
+                        "timestamp": time.time(),
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "[api_server] durable stop intent failed for %s", run_id
+                )
+                return self._durable_unavailable_response()
+            self._stop_intent_run_ids.add(run_id)
+            # Classification is derived from the committed intent and must be
+            # set before any fallible projection/readback below.
+            self._stopping_run_ids.add(run_id)
+
+        try:
+            self._set_run_status(run_id, "stopping", last_event="run.stopping")
+        except Exception:
+            logger.exception(
+                "[api_server] durable stopping projection failed for %s", run_id
+            )
+            if agent is not None:
+                try:
+                    agent.interrupt("Stop accepted but durable status verification failed")
+                except Exception:
+                    pass
+            return self._durable_unavailable_response()
         self._stopping_run_ids.add(run_id)
 
         if agent is not None:
             try:
                 agent.interrupt("Stop requested via API")
             except Exception:
-                pass
+                logger.exception(
+                    "[api_server] live stop delivery failed for %s", run_id
+                )
+                if self._broker_enabled():
+                    return self._durable_unavailable_response()
 
-        return web.json_response({"run_id": run_id, "status": "stopping"})
+        return web.json_response(
+            {"run_id": run_id, "status": "running", "substate": "stopping"}
+        )
 
     async def _sweep_orphaned_runs(self) -> None:
         """Periodically expire transport buffers and terminal status records."""
@@ -6134,6 +6942,31 @@ class APIServerAdapter(BasePlatformAdapter):
             pass
         return True
 
+    def _close_owned_durable_store_then_release_authority(self) -> None:
+        """Close factory-owned SQLite while fenced, then release authority.
+
+        Startup can fail before ``disconnect()`` is reached (bind, reconcile,
+        or generic application setup).  A factory-owned store has already
+        opened WAL and may have performed DDL, so the lock must remain held
+        through its final checkpoint/close on every one of those paths.
+        Borrowed stores remain open, but their adapter-owned fence is released.
+        """
+        durable_store = getattr(self, "_durable_store", None)
+        if getattr(self, "_owns_durable_store", False) and durable_store is not None:
+            self._durable_store = None
+            self._owns_durable_store = False
+            try:
+                durable_store.close()
+            except Exception:
+                logger.debug(
+                    "Failed to close durable run store for %s",
+                    self.name,
+                    exc_info=True,
+                )
+        authority_lock = getattr(self, "_durable_authority_lock", None)
+        if authority_lock is not None:
+            authority_lock.release()
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Start the aiohttp web server."""
         if not AIOHTTP_AVAILABLE:
@@ -6142,6 +6975,35 @@ class APIServerAdapter(BasePlatformAdapter):
 
         if not self._api_key_passes_startup_guard():
             return False
+
+        if self._durable_store_required and self._durable_store is None:
+            logger.error(
+                "[%s] Refusing to reconnect with a closed durable store; "
+                "construct a fresh adapter/store instead of degrading to legacy mode.",
+                self.name,
+            )
+            return False
+
+        if self._broker_enabled():
+            from gateway.durable_runs import DurableAuthorityLock
+
+            if self._durable_authority_lock is None:
+                self._durable_authority_lock = DurableAuthorityLock(
+                    self._durable_store.db_path
+                )
+            if not self._durable_authority_lock.acquire():
+                self._set_fatal_error(
+                    "durable_authority_held",
+                    "Another API server process owns the durable run database; "
+                    "refusing a second writer/reconciler.",
+                    retryable=False,
+                )
+                logger.error(
+                    "[%s] Refusing to start: durable authority already held for %s",
+                    self.name,
+                    self._durable_store.db_path,
+                )
+                return False
 
         try:
             mws = [
@@ -6169,19 +7031,6 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app["api_server_adapter"] = self
             if self.gateway_runner is not None:
                 self._app["gateway_runner"] = self.gateway_runner
-
-            # V2.8: reconcile phantom in-flight runs to a deterministic terminal
-            # state (stopped) before serving. No-op unless a durable store is set.
-            self.reconcile_durable_runs()
-
-            # Start background sweep to clean up orphaned (unconsumed) run streams
-            sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
-            try:
-                self._background_tasks.add(sweep_task)
-            except TypeError:
-                pass
-            if hasattr(sweep_task, "add_done_callback"):
-                sweep_task.add_done_callback(self._background_tasks.discard)
 
             # Loud warning when a network-accessible API server runs against an
             # unsandboxed local terminal backend. The API server can drive the
@@ -6237,6 +7086,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 await self._runner.cleanup()
                 self._runner = None
                 self._site = None
+                self._close_owned_durable_store_then_release_authority()
                 if getattr(exc, "errno", None) == errno.EADDRINUSE:
                     # A port conflict is a configuration error, not a
                     # transient blip — another process holds the port for
@@ -6263,6 +7113,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 return False
 
+            # Mutate durable startup state only after this adapter owns the
+            # listening socket. A failed bind must leave another instance's
+            # queued/running facts untouched and create no background task.
+            self.reconcile_durable_runs()
+
+            sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
+            try:
+                self._background_tasks.add(sweep_task)
+            except TypeError:
+                pass
+            if hasattr(sweep_task, "add_done_callback"):
+                sweep_task.add_done_callback(self._background_tasks.discard)
+
             self._mark_connected()
             logger.info(
                 "[%s] API server listening on http://%s:%d (model: %s)",
@@ -6271,6 +7134,28 @@ class APIServerAdapter(BasePlatformAdapter):
             return True
 
         except Exception as e:
+            # A failure after TCPSite.start (notably startup reconciliation)
+            # must tear down the listener before releasing DB authority.
+            if self._site is not None:
+                try:
+                    await self._site.stop()
+                except Exception:
+                    logger.debug(
+                        "Failed to stop partially started API site",
+                        exc_info=True,
+                    )
+                self._site = None
+            if self._runner is not None:
+                try:
+                    await self._runner.cleanup()
+                except Exception:
+                    logger.debug(
+                        "Failed to clean partially started API runner",
+                        exc_info=True,
+                    )
+                self._runner = None
+            self._app = None
+            self._close_owned_durable_store_then_release_authority()
             logger.error("[%s] Failed to start API server: %s", self.name, e)
             return False
 
@@ -6300,6 +7185,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
+        self._close_owned_durable_store_then_release_authority()
         self._app = None
         logger.info("[%s] API server stopped", self.name)
 

@@ -115,6 +115,7 @@ class TestChallengeIssued:
                 notify = approval_mod._gateway_notify_cbs.get(run_id)
                 if notify is not None:
                     notify(dict(entry.data))
+                await asyncio.sleep(0)
 
                 # The store must hold a challenge for this run bound to the action.
                 challenges = [
@@ -126,13 +127,93 @@ class TestChallengeIssued:
                 ch = dict(challenges[0])
                 assert ch["action_digest"]
                 assert ch["expires_at"] > 0
+                request_event = next(
+                    event
+                    for event in store.replay_events(run_id)
+                    if event.event_type == "approval.request"
+                )
+                assert "pattern_key" not in request_event.payload
+                assert "pattern_keys" not in request_event.payload
             finally:
                 with approval_mod._lock:
                     approval_mod._gateway_queues.pop(run_id, None)
                 interrupted.set()
 
+    @pytest.mark.asyncio
+    async def test_challenge_store_failure_never_publishes_unanswerable_request(
+        self, store, monkeypatch
+    ):
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            run_id, mock_agent, interrupted = await _start_live_run(adapter, cli)
+            try:
+                notify = approval_mod._gateway_notify_cbs[run_id]
+
+                def _fail(*args, **kwargs):
+                    raise OSError("approval store unavailable")
+
+                monkeypatch.setattr(store, "issue_approval_challenge", _fail)
+                with pytest.raises(RuntimeError, match="challenge unavailable"):
+                    notify(dict(_pending_entry().data))
+
+                await asyncio.sleep(0)
+                assert store.get_run(run_id)["status"] == "running"
+                assert not any(
+                    event.event_type == "approval.request"
+                    for event in store.replay_events(run_id)
+                )
+            finally:
+                interrupted.set()
+
 
 class TestApprovalCAS:
+    @pytest.mark.asyncio
+    async def test_challenge_resolves_only_its_exact_concurrent_entry(self, store):
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            run_id, mock_agent, interrupted = await _start_live_run(adapter, cli)
+            try:
+                first = _pending_entry(command="first dangerous command")
+                second = _pending_entry(command="second dangerous command")
+                with approval_mod._lock:
+                    approval_mod._gateway_queues[run_id] = [first, second]
+
+                notify = approval_mod._gateway_notify_cbs.get(run_id)
+                assert notify is not None
+                notify(dict(first.data))
+                notify(dict(second.data))
+                challenges = {
+                    row["approval_id"]: dict(row)
+                    for row in store._conn.execute(
+                        "SELECT * FROM approval_grants WHERE run_id = ?", (run_id,)
+                    ).fetchall()
+                }
+                challenge = challenges[second.approval_id]
+
+                response = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={
+                        "choice": "once",
+                        "challenge_id": challenge["challenge_id"],
+                        "action_digest": challenge["action_digest"],
+                        "resolve_all": True,
+                    },
+                )
+
+                assert response.status == 200
+                response_body = await response.json()
+                assert response_body["decision_status"] == "committed"
+                assert response_body["waiter_signal_status"] == "confirmed"
+                assert "resolved" not in response_body
+                assert second.event.is_set()
+                assert not first.event.is_set()
+            finally:
+                with approval_mod._lock:
+                    approval_mod._gateway_queues.pop(run_id, None)
+                interrupted.set()
+
     @pytest.mark.asyncio
     async def test_missing_challenge_id_rejected(self, store):
         """POST without challenge_id ⇒ 409, queue NOT resolved (fail closed)."""
@@ -198,8 +279,8 @@ class TestApprovalCAS:
                 interrupted.set()
 
     @pytest.mark.asyncio
-    async def test_replay_consume_rejected(self, store):
-        """A consumed grant cannot be replayed (single-use): 2nd POST ⇒ 409."""
+    async def test_exact_completed_replay_is_idempotent_without_second_decision(self, store):
+        """Lost HTTP ACK can replay the same immutable decision, never rewrite it."""
         adapter = _make_adapter(durable_store=store)
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
@@ -220,9 +301,11 @@ class TestApprovalCAS:
                            "action_digest": ch["action_digest"]}
                 first = await cli.post(f"/v1/runs/{run_id}/approval", json=payload)
                 assert first.status == 200
-                # Replay the exact same grant ⇒ rejected (already consumed).
+                before = list(store.replay_events(run_id))
                 replay = await cli.post(f"/v1/runs/{run_id}/approval", json=payload)
-                assert replay.status == 409
+                assert replay.status == 200
+                assert (await replay.json())["idempotent_replay"] is True
+                assert len(store.replay_events(run_id)) == len(before)
             finally:
                 with approval_mod._lock:
                     approval_mod._gateway_queues.pop(run_id, None)
@@ -330,10 +413,9 @@ class TestApprovalConsumeDoesNotBurnOnNonSuccess:
                 )
                 assert row["consumed"] == 0, "grant must not burn on non-success"
 
-                # Retry with a real pending entry must still succeed (grant intact).
-                entry2 = _pending_entry()
+                # Retry with the exact pending entry must still succeed (grant intact).
                 with approval_mod._lock:
-                    approval_mod._gateway_queues[run_id] = [entry2]
+                    approval_mod._gateway_queues[run_id] = [entry]
                 good = await cli.post(
                     f"/v1/runs/{run_id}/approval",
                     json={
@@ -343,15 +425,14 @@ class TestApprovalConsumeDoesNotBurnOnNonSuccess:
                     },
                 )
                 assert good.status == 200
-                assert entry2.event.is_set()
+                assert entry.event.is_set()
             finally:
                 with approval_mod._lock:
                     approval_mod._gateway_queues.pop(run_id, None)
                 interrupted.set()
 
     @pytest.mark.asyncio
-    async def test_resolve_zero_restores_grant(self, store):
-        """If resolve returns 0 after consume (TOCTOU), grant is restored."""
+    async def test_decision_append_failure_does_not_signal_or_consume(self, store, monkeypatch):
         adapter = _make_adapter(durable_store=store)
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
@@ -369,21 +450,29 @@ class TestApprovalConsumeDoesNotBurnOnNonSuccess:
                     ).fetchone()
                 )
 
-                # has_blocking_approval True, but resolve forced to 0.
-                with patch(
-                    "tools.approval.resolve_gateway_approval", return_value=0
-                ), patch(
-                    "tools.approval.has_blocking_approval", return_value=True
-                ):
-                    resp = await cli.post(
-                        f"/v1/runs/{run_id}/approval",
-                        json={
-                            "choice": "once",
-                            "challenge_id": ch["challenge_id"],
-                            "action_digest": ch["action_digest"],
-                        },
-                    )
-                assert resp.status == 409
+                await asyncio.sleep(0)
+                original_append = store.append_event
+
+                def _fail_decision(run_id_arg, event_type, payload):
+                    if event_type == "approval.decision_recorded":
+                        assert entry.claimed is True
+                        with approval_mod._lock:
+                            assert entry not in approval_mod._gateway_queues.get(
+                                run_id, []
+                            )
+                        raise OSError("decision event unavailable")
+                    return original_append(run_id_arg, event_type, payload)
+
+                monkeypatch.setattr(store, "append_event", _fail_decision)
+                resp = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={
+                        "choice": "once",
+                        "challenge_id": ch["challenge_id"],
+                        "action_digest": ch["action_digest"],
+                    },
+                )
+                assert resp.status == 503
                 row = dict(
                     store._conn.execute(
                         "SELECT consumed FROM approval_grants WHERE challenge_id = ?",
@@ -392,6 +481,470 @@ class TestApprovalConsumeDoesNotBurnOnNonSuccess:
                 )
                 assert row["consumed"] == 0
                 assert not entry.event.is_set()
+                assert store.get_approval_decision(ch["challenge_id"]) is None
+                assert entry.claimed is False
+                with approval_mod._lock:
+                    assert entry in approval_mod._gateway_queues[run_id]
+            finally:
+                with approval_mod._lock:
+                    approval_mod._gateway_queues.pop(run_id, None)
+                interrupted.set()
+
+    @pytest.mark.asyncio
+    async def test_stop_intent_rejects_exact_approval_without_signalling(
+        self, store
+    ):
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            run_id, _mock_agent, interrupted = await _start_live_run(adapter, cli)
+            try:
+                entry = _pending_entry()
+                with approval_mod._lock:
+                    approval_mod._gateway_queues[run_id] = [entry]
+                approval_mod._gateway_notify_cbs[run_id](dict(entry.data))
+                await asyncio.sleep(0)
+                challenge = dict(
+                    store._conn.execute(
+                        "SELECT * FROM approval_grants WHERE run_id = ?", (run_id,)
+                    ).fetchone()
+                )
+                store.append_event(
+                    run_id,
+                    "run.stop_requested",
+                    {"event": "run.stop_requested", "run_id": run_id},
+                )
+
+                response = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={
+                        "choice": "once",
+                        "challenge_id": challenge["challenge_id"],
+                        "action_digest": challenge["action_digest"],
+                    },
+                )
+
+                assert response.status == 409
+                assert not entry.event.is_set()
+                assert entry.claimed is False
+                assert store.get_approval_challenge(challenge["challenge_id"])[
+                    "consumed"
+                ] == 0
+            finally:
+                with approval_mod._lock:
+                    approval_mod._gateway_queues.pop(run_id, None)
+                interrupted.set()
+
+    @pytest.mark.asyncio
+    async def test_live_delivery_exception_is_recoverable_not_false_success(
+        self, store, monkeypatch
+    ):
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            run_id, _mock_agent, interrupted = await _start_live_run(adapter, cli)
+            try:
+                entry = _pending_entry()
+                with approval_mod._lock:
+                    approval_mod._gateway_queues[run_id] = [entry]
+                approval_mod._gateway_notify_cbs[run_id](dict(entry.data))
+                await asyncio.sleep(0)
+                challenge = dict(
+                    store._conn.execute(
+                        "SELECT * FROM approval_grants WHERE run_id = ?", (run_id,)
+                    ).fetchone()
+                )
+                original_finalize = approval_mod.finalize_gateway_approval_claim
+                monkeypatch.setattr(
+                    approval_mod,
+                    "finalize_gateway_approval_claim",
+                    lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                        RuntimeError("delivery failed")
+                    ),
+                )
+
+                response = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={
+                        "choice": "once",
+                        "challenge_id": challenge["challenge_id"],
+                        "action_digest": challenge["action_digest"],
+                    },
+                )
+
+                assert response.status == 503
+                assert not entry.event.is_set()
+                assert entry.result is None
+                assert entry.claimed is False
+                assert store.get_approval_response(challenge["challenge_id"]) is not None
+                assert store.get_approval_delivery(challenge["challenge_id"]) is None
+                with approval_mod._lock:
+                    assert entry in approval_mod._gateway_queues[run_id]
+
+                monkeypatch.setattr(
+                    approval_mod,
+                    "finalize_gateway_approval_claim",
+                    original_finalize,
+                )
+                recovered = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={
+                        "choice": "once",
+                        "challenge_id": challenge["challenge_id"],
+                        "action_digest": challenge["action_digest"],
+                    },
+                )
+                assert recovered.status == 200
+                assert entry.event.is_set()
+                assert store.get_approval_delivery(challenge["challenge_id"]) is not None
+            finally:
+                with approval_mod._lock:
+                    approval_mod._gateway_queues.pop(run_id, None)
+                interrupted.set()
+
+    @pytest.mark.asyncio
+    async def test_release_commit_before_signal_reports_unknown_then_recovers_exact_waiter(
+        self, store, monkeypatch
+    ):
+        """A crash gap after durable release commit is not delivery evidence."""
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            run_id, _mock_agent, interrupted = await _start_live_run(adapter, cli)
+            try:
+                entry = _pending_entry()
+                with approval_mod._lock:
+                    approval_mod._gateway_queues[run_id] = [entry]
+                approval_mod._gateway_notify_cbs[run_id](dict(entry.data))
+                await asyncio.sleep(0)
+                challenge = dict(
+                    store._conn.execute(
+                        "SELECT * FROM approval_grants WHERE run_id = ?", (run_id,)
+                    ).fetchone()
+                )
+                original_finalize = approval_mod.finalize_gateway_approval_claim
+
+                def _commit_then_crash(_entry, _choice, *, before_signal=None, **_kwargs):
+                    assert before_signal is not None
+                    before_signal()
+                    raise RuntimeError("crash after release commit before Event.set")
+
+                monkeypatch.setattr(
+                    approval_mod,
+                    "finalize_gateway_approval_claim",
+                    _commit_then_crash,
+                )
+                payload = {
+                    "choice": "once",
+                    "challenge_id": challenge["challenge_id"],
+                    "action_digest": challenge["action_digest"],
+                }
+
+                first = await cli.post(f"/v1/runs/{run_id}/approval", json=payload)
+                first_body = await first.json()
+
+                assert first.status == 200
+                assert first_body["decision_status"] == "committed"
+                assert first_body["waiter_signal_status"] == "unknown"
+                assert "resolved" not in first_body
+                assert not entry.event.is_set()
+                events = store.replay_events(run_id)
+                assert len(
+                    [e for e in events if e.event_type == "approval.release_committed"]
+                ) == 1
+                assert not any(e.event_type == "approval.signalled" for e in events)
+
+                monkeypatch.setattr(
+                    approval_mod,
+                    "finalize_gateway_approval_claim",
+                    original_finalize,
+                )
+                recovered = await cli.post(
+                    f"/v1/runs/{run_id}/approval", json=payload
+                )
+                recovered_body = await recovered.json()
+
+                assert recovered.status == 200
+                assert recovered_body["decision_status"] == "committed"
+                assert recovered_body["waiter_signal_status"] == "confirmed"
+                assert "resolved" not in recovered_body
+                assert entry.event.is_set()
+                events = store.replay_events(run_id)
+                assert len(
+                    [e for e in events if e.event_type == "approval.release_committed"]
+                ) == 1
+                assert len(
+                    [e for e in events if e.event_type == "approval.signalled"]
+                ) == 1
+            finally:
+                with approval_mod._lock:
+                    approval_mod._gateway_queues.pop(run_id, None)
+                interrupted.set()
+
+    @pytest.mark.asyncio
+    async def test_stop_in_release_commit_signal_gap_never_signals_waiter(
+        self, store, monkeypatch
+    ):
+        """A stop committed in the crash gap wins over same-choice recovery."""
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            run_id, _mock_agent, interrupted = await _start_live_run(adapter, cli)
+            try:
+                entry = _pending_entry()
+                with approval_mod._lock:
+                    approval_mod._gateway_queues[run_id] = [entry]
+                approval_mod._gateway_notify_cbs[run_id](dict(entry.data))
+                await asyncio.sleep(0)
+                challenge = dict(
+                    store._conn.execute(
+                        "SELECT * FROM approval_grants WHERE run_id = ?", (run_id,)
+                    ).fetchone()
+                )
+
+                def _commit_then_crash(_entry, _choice, *, before_signal=None, **_kwargs):
+                    assert before_signal is not None
+                    before_signal()
+                    raise RuntimeError("crash after release commit before Event.set")
+
+                monkeypatch.setattr(
+                    approval_mod,
+                    "finalize_gateway_approval_claim",
+                    _commit_then_crash,
+                )
+                payload = {
+                    "choice": "once",
+                    "challenge_id": challenge["challenge_id"],
+                    "action_digest": challenge["action_digest"],
+                }
+                first = await cli.post(f"/v1/runs/{run_id}/approval", json=payload)
+                assert first.status == 200
+                assert (await first.json())["waiter_signal_status"] == "unknown"
+                assert not entry.event.is_set()
+
+                store.append_event(
+                    run_id,
+                    "run.stop_requested",
+                    {"event": "run.stop_requested", "run_id": run_id},
+                )
+                replay = await cli.post(
+                    f"/v1/runs/{run_id}/approval", json=payload
+                )
+                replay_body = await replay.json()
+
+                assert replay.status == 200
+                assert replay_body["decision_status"] == "committed"
+                assert replay_body["waiter_signal_status"] == "unknown"
+                assert "resolved" not in replay_body
+                assert not entry.event.is_set()
+                assert not any(
+                    event.event_type == "approval.signalled"
+                    for event in store.replay_events(run_id)
+                )
+            finally:
+                with approval_mod._lock:
+                    approval_mod._gateway_queues.pop(run_id, None)
+                interrupted.set()
+
+    @pytest.mark.asyncio
+    async def test_response_append_failure_recovers_only_same_choice(
+        self, store, monkeypatch
+    ):
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            run_id, mock_agent, interrupted = await _start_live_run(adapter, cli)
+            try:
+                entry = _pending_entry()
+                with approval_mod._lock:
+                    approval_mod._gateway_queues[run_id] = [entry]
+                notify = approval_mod._gateway_notify_cbs[run_id]
+                notify(dict(entry.data))
+                await asyncio.sleep(0)
+                ch = dict(
+                    store._conn.execute(
+                        "SELECT * FROM approval_grants WHERE run_id = ?", (run_id,)
+                    ).fetchone()
+                )
+                original_append = store.append_event
+
+                def _fail_response(run_id_arg, event_type, payload):
+                    if event_type == "approval.responded":
+                        raise OSError("response event unavailable")
+                    return original_append(run_id_arg, event_type, payload)
+
+                monkeypatch.setattr(store, "append_event", _fail_response)
+                payload = {
+                    "choice": "once",
+                    "challenge_id": ch["challenge_id"],
+                    "action_digest": ch["action_digest"],
+                }
+                failed = await cli.post(f"/v1/runs/{run_id}/approval", json=payload)
+                assert failed.status == 503
+                assert not entry.event.is_set()
+                assert store.get_approval_challenge(ch["challenge_id"])["consumed"] == 1
+                decision = store.get_approval_decision(ch["challenge_id"])
+                assert decision is not None
+                assert decision.payload["choice"] == "once"
+
+                changed = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={**payload, "choice": "deny"},
+                )
+                assert changed.status == 409
+                assert not entry.event.is_set()
+
+                monkeypatch.setattr(store, "append_event", original_append)
+                recovered = await cli.post(
+                    f"/v1/runs/{run_id}/approval", json=payload
+                )
+                assert recovered.status == 200
+                recovered_body = await recovered.json()
+                assert recovered_body["approval_id"] == ch["approval_id"]
+                assert entry.event.is_set()
+
+                replay = store.replay_events(run_id)
+                decisions = [
+                    event for event in replay
+                    if event.event_type == "approval.decision_recorded"
+                ]
+                responses = [
+                    event for event in replay
+                    if event.event_type == "approval.responded"
+                ]
+                deliveries = [
+                    event for event in replay
+                    if event.event_type == "approval.signalled"
+                ]
+                releases = [
+                    event for event in replay
+                    if event.event_type == "approval.release_committed"
+                ]
+                assert len(decisions) == len(responses) == 1
+                assert len(releases) == 1
+                assert len(deliveries) == 1
+                assert responses[0].payload["decision_status"] == "committed"
+                assert responses[0].payload["waiter_signal_status"] == "unknown"
+                assert "resolved" not in responses[0].payload
+                assert responses[0].seq < releases[0].seq < deliveries[0].seq
+                assert responses[0].payload["challenge_id"] == ch["challenge_id"]
+                assert responses[0].payload["approval_id"] == ch["approval_id"]
+                assert responses[0].payload["action_digest"] == ch["action_digest"]
+
+                # Lost HTTP ACK: exact retry is a 200 idempotent replay even
+                # though the live queue entry has already been released.
+                replayed = await cli.post(
+                    f"/v1/runs/{run_id}/approval", json=payload
+                )
+                assert replayed.status == 200
+                assert (await replayed.json())["idempotent_replay"] is True
+                assert len(store.replay_events(run_id)) == len(replay)
+            finally:
+                with approval_mod._lock:
+                    approval_mod._gateway_queues.pop(run_id, None)
+                interrupted.set()
+
+    @pytest.mark.asyncio
+    async def test_response_failure_then_stop_blocks_same_choice_delivery(
+        self, store, monkeypatch
+    ):
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            run_id, _mock_agent, interrupted = await _start_live_run(adapter, cli)
+            try:
+                entry = _pending_entry()
+                with approval_mod._lock:
+                    approval_mod._gateway_queues[run_id] = [entry]
+                approval_mod._gateway_notify_cbs[run_id](dict(entry.data))
+                await asyncio.sleep(0)
+                challenge = dict(
+                    store._conn.execute(
+                        "SELECT * FROM approval_grants WHERE run_id = ?", (run_id,)
+                    ).fetchone()
+                )
+                original_append = store.append_event
+
+                def _fail_response(run_id_arg, event_type, payload):
+                    if event_type == "approval.responded":
+                        raise OSError("response unavailable")
+                    return original_append(run_id_arg, event_type, payload)
+
+                monkeypatch.setattr(store, "append_event", _fail_response)
+                payload = {
+                    "choice": "once",
+                    "challenge_id": challenge["challenge_id"],
+                    "action_digest": challenge["action_digest"],
+                }
+                first = await cli.post(f"/v1/runs/{run_id}/approval", json=payload)
+                assert first.status == 503
+                assert store.get_approval_decision(challenge["challenge_id"]) is not None
+                assert not entry.event.is_set()
+
+                monkeypatch.setattr(store, "append_event", original_append)
+                store.append_event(
+                    run_id,
+                    "run.stop_requested",
+                    {"event": "run.stop_requested", "run_id": run_id},
+                )
+                replay = await cli.post(f"/v1/runs/{run_id}/approval", json=payload)
+
+                assert replay.status == 200
+                replay_body = await replay.json()
+                assert replay_body["decision_status"] == "committed"
+                assert replay_body["waiter_signal_status"] == "unknown"
+                assert "resolved" not in replay_body
+                assert not entry.event.is_set()
+                assert store.get_approval_response(challenge["challenge_id"]) is None
+                assert store.get_approval_delivery(challenge["challenge_id"]) is None
+            finally:
+                with approval_mod._lock:
+                    approval_mod._gateway_queues.pop(run_id, None)
+                interrupted.set()
+
+    @pytest.mark.asyncio
+    async def test_finalizer_false_never_commits_release_or_signals(
+        self, store, monkeypatch
+    ):
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            run_id, _mock_agent, interrupted = await _start_live_run(adapter, cli)
+            try:
+                entry = _pending_entry()
+                with approval_mod._lock:
+                    approval_mod._gateway_queues[run_id] = [entry]
+                approval_mod._gateway_notify_cbs[run_id](dict(entry.data))
+                await asyncio.sleep(0)
+                challenge = dict(
+                    store._conn.execute(
+                        "SELECT * FROM approval_grants WHERE run_id = ?", (run_id,)
+                    ).fetchone()
+                )
+                monkeypatch.setattr(
+                    approval_mod,
+                    "finalize_gateway_approval_claim",
+                    lambda *_args, **_kwargs: False,
+                )
+                payload = {
+                    "choice": "once",
+                    "challenge_id": challenge["challenge_id"],
+                    "action_digest": challenge["action_digest"],
+                }
+
+                first = await cli.post(f"/v1/runs/{run_id}/approval", json=payload)
+                replay = await cli.post(f"/v1/runs/{run_id}/approval", json=payload)
+
+                assert first.status == 503
+                assert replay.status == 503
+                assert not entry.event.is_set()
+                assert entry.result is None
+                assert store.get_approval_response(challenge["challenge_id"]) is not None
+                assert store.get_approval_delivery(challenge["challenge_id"]) is None
+                assert store.get_approval_release(challenge["challenge_id"]) is None
+                assert "resolved" not in store.get_approval_response(
+                    challenge["challenge_id"]
+                ).payload
             finally:
                 with approval_mod._lock:
                     approval_mod._gateway_queues.pop(run_id, None)

@@ -135,14 +135,14 @@ class TestStartRun:
                 resp = await cli.post("/v1/runs", json={"input": "hello"})
                 assert resp.status == 202
                 data = await resp.json()
-                assert data["status"] == "started"
+                assert data["status"] == "queued"
                 assert data["run_id"].startswith("run_")
 
                 status_resp = await cli.get(f"/v1/runs/{data['run_id']}")
                 assert status_resp.status == 200
                 status = await status_resp.json()
                 assert status["run_id"] == data["run_id"]
-                assert status["status"] in {"queued", "running", "completed"}
+                assert status["status"] in {"queued", "running", "succeeded"}
                 assert status["object"] == "hermes.run"
 
     @pytest.mark.asyncio
@@ -217,13 +217,79 @@ class TestStartRun:
 
 
 class TestRunStatus:
+    @pytest.mark.parametrize(
+        ("internal_status", "public_status", "substate"),
+        [
+            ("queued", "queued", None),
+            ("running", "running", None),
+            ("waiting_for_approval", "running", "waiting_for_approval"),
+            ("stopping", "running", "stopping"),
+            ("completed", "succeeded", None),
+            ("failed", "failed", None),
+            ("cancelled", "stopped", None),
+            ("succeeded", "succeeded", None),
+            ("stopped", "stopped", None),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_get_projects_only_canonical_run_states(
+        self, adapter, internal_status, public_status, substate
+    ):
+        run_id = f"run_projection_{internal_status}"
+        adapter._run_statuses[run_id] = {
+            "run_id": run_id,
+            "status": internal_status,
+            "substate": "stale-value",
+        }
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.get(f"/v1/runs/{run_id}")
+            body = await response.json()
+
+        assert response.status == 200
+        assert body["status"] == public_status
+        if substate is None:
+            assert "substate" not in body
+        else:
+            assert body["substate"] == substate
+
+    @pytest.mark.asyncio
+    async def test_get_unknown_internal_state_fails_closed(self, adapter):
+        run_id = "run_projection_unknown"
+        adapter._run_statuses[run_id] = {
+            "run_id": run_id,
+            "status": "future_unreviewed_state",
+        }
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.get(f"/v1/runs/{run_id}")
+            body = await response.json()
+
+        assert response.status == 503
+        assert body["error"]["code"] == "run_state_invalid"
+        assert "future_unreviewed_state" not in str(body)
+
     @pytest.mark.asyncio
     async def test_status_completed_run_includes_output_and_usage(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             with patch.object(adapter, "_create_agent") as mock_create:
                 mock_agent = MagicMock()
-                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.model = "receipt-model"
+                mock_agent.provider = "receipt-provider"
+
+                def _run_with_response_receipt(**_kwargs):
+                    route = {
+                        "model": mock_agent.model,
+                        "provider": mock_agent.provider,
+                    }
+                    mock_agent._provider_attempt_callback(dict(route))
+                    mock_agent._provider_response_callback(dict(route))
+                    return {"final_response": "done"}
+
+                mock_agent.run_conversation.side_effect = _run_with_response_receipt
                 mock_agent.session_prompt_tokens = 4
                 mock_agent.session_completion_tokens = 2
                 mock_agent.session_total_tokens = 6
@@ -237,11 +303,11 @@ class TestRunStatus:
                     status_resp = await cli.get(f"/v1/runs/{run_id}")
                     assert status_resp.status == 200
                     status = await status_resp.json()
-                    if status["status"] == "completed":
+                    if status["status"] == "succeeded":
                         break
                     await asyncio.sleep(0.05)
 
-                assert status["status"] == "completed"
+                assert status["status"] == "succeeded"
                 assert status["output"] == "done"
                 assert status["usage"]["total_tokens"] == 6
                 assert status["last_event"] == "run.completed"
@@ -268,7 +334,7 @@ class TestRunStatus:
                 for _ in range(20):
                     status_resp = await cli.get(f"/v1/runs/{run_id}")
                     status = await status_resp.json()
-                    if status["status"] == "completed":
+                    if status["status"] == "succeeded":
                         break
                     await asyncio.sleep(0.05)
 
@@ -716,7 +782,11 @@ class TestStopRun:
                 assert stop_resp.status == 200
                 stop_data = await stop_resp.json()
                 assert stop_data["run_id"] == run_id
-                assert stop_data["status"] == "stopping"
+                assert stop_data == {
+                    "run_id": run_id,
+                    "status": "running",
+                    "substate": "stopping",
+                }
 
                 # Agent interrupt should have been called
                 mock_agent.interrupt.assert_called_once_with("Stop requested via API")
@@ -724,7 +794,9 @@ class TestStopRun:
                 status_resp = await cli.get(f"/v1/runs/{run_id}")
                 assert status_resp.status == 200
                 status_data = await status_resp.json()
-                assert status_data["status"] in {"stopping", "cancelled"}
+                assert status_data["status"] in {"running", "stopped"}
+                if status_data["status"] == "running":
+                    assert status_data["substate"] == "stopping"
 
                 # Refs should be cleaned up
                 await asyncio.sleep(0.5)
@@ -803,7 +875,8 @@ class TestStopRun:
                 stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
                 assert stop_resp.status == 200
                 stop_data = await stop_resp.json()
-                assert stop_data["status"] == "stopping"
+                assert stop_data["status"] == "running"
+                assert stop_data["substate"] == "stopping"
 
     @pytest.mark.asyncio
     async def test_stop_sends_sentinel_to_events_stream(self, adapter):

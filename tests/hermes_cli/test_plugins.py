@@ -987,7 +987,7 @@ class TestResolvePreToolBlock:
         }
 
     @pytest.mark.parametrize("rule_key", [None, "", "   ", 123, object()])
-    def test_approve_falls_back_to_tool_name_without_valid_rule_key(
+    def test_approve_defers_default_rule_grain_to_reason_aware_gate(
         self, monkeypatch, rule_key
     ):
         from hermes_cli.plugins import resolve_pre_tool_block
@@ -1009,7 +1009,7 @@ class TestResolvePreToolBlock:
         monkeypatch.setattr("tools.approval.request_tool_approval", _approve)
 
         assert resolve_pre_tool_block("write_file", {}) is None
-        assert seen["rule_key"] == "write_file"
+        assert seen["rule_key"] == ""
 
     def test_approve_gate_exception_fails_closed(self, monkeypatch):
         from hermes_cli.plugins import resolve_pre_tool_block

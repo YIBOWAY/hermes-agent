@@ -4,12 +4,14 @@ Validates that is_network_accessible() correctly classifies addresses and
 that connect() refuses to start without API_SERVER_KEY.
 """
 
+import errno
 import socket
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.durable_runs import DurableRunStore, RunState
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.platforms.base import is_network_accessible
 
@@ -219,6 +221,75 @@ class TestBindMechanics:
         assert not hasattr(APIServerAdapter, "_port_is_available")
 
     @pytest.mark.asyncio
+    async def test_factory_store_bind_failure_closes_before_unlock(self, tmp_path):
+        order = []
+        store = MagicMock()
+        store.db_path = tmp_path / "bind-failure.db"
+        lock = MagicMock()
+        lock.acquire.return_value = True
+        store.authority_lock = lock
+        store.close.side_effect = lambda: order.append("close")
+        lock.release.side_effect = lambda: order.append("release")
+        adapter = APIServerAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "host": "127.0.0.1",
+                    "port": self._free_port(),
+                    "key": self._KEY,
+                },
+            ),
+            durable_store=store,
+            owns_durable_store=True,
+        )
+
+        with patch(
+            "gateway.platforms.api_server.web.TCPSite.start",
+            new=AsyncMock(side_effect=OSError(errno.EADDRINUSE, "occupied")),
+        ):
+            assert await adapter.connect() is False
+
+        assert order == ["close", "release"]
+        assert adapter._durable_store is None
+        assert adapter._runner is None
+        assert await adapter.connect() is False
+
+    @pytest.mark.asyncio
+    async def test_factory_store_reconcile_failure_closes_before_unlock(self, tmp_path):
+        order = []
+        store = MagicMock()
+        store.db_path = tmp_path / "reconcile-failure.db"
+        lock = MagicMock()
+        lock.acquire.return_value = True
+        store.authority_lock = lock
+        store.close.side_effect = lambda: order.append("close")
+        lock.release.side_effect = lambda: order.append("release")
+        adapter = APIServerAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "host": "127.0.0.1",
+                    "port": self._free_port(),
+                    "key": self._KEY,
+                },
+            ),
+            durable_store=store,
+            owns_durable_store=True,
+        )
+
+        with patch.object(
+            adapter,
+            "reconcile_durable_runs",
+            side_effect=RuntimeError("reconcile failed"),
+        ):
+            assert await adapter.connect() is False
+
+        assert order == ["close", "release"]
+        assert adapter._durable_store is None
+        assert adapter._site is None
+        assert adapter._runner is None
+
+    @pytest.mark.asyncio
     async def test_port_conflict_sets_non_retryable_fatal_error(self):
         """A real port conflict (EADDRINUSE) must set a non-retryable fatal
         error so the reconnect watcher drops the platform from the retry
@@ -243,3 +314,79 @@ class TestBindMechanics:
         finally:
             await first.disconnect()
             await second.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_port_conflict_does_not_reconcile_unserved_durable_run(self, tmp_path):
+        port = self._free_port()
+        first = self._make_adapter(port)
+        assert await first.connect() is True
+        store = DurableRunStore(tmp_path / "durable.db")
+        store.register_run(run_id="run_unserved", session_id="session")
+        store.transition("run_unserved", RunState.RUNNING)
+        second = APIServerAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={"host": "127.0.0.1", "port": port, "key": self._KEY},
+            ),
+            durable_store=store,
+        )
+        try:
+            assert await second.connect() is False
+            assert store.get_run("run_unserved")["status"] == RunState.RUNNING.value
+            assert second._background_tasks == set()
+        finally:
+            await first.disconnect()
+            await second.disconnect()
+            store.close()
+
+    @pytest.mark.asyncio
+    async def test_shared_durable_db_has_one_authority_across_different_ports(
+        self, tmp_path
+    ):
+        """The DB authority fence is independent of the HTTP bind address."""
+        db_path = tmp_path / "shared-durable.db"
+        first_store = DurableRunStore(db_path)
+        second_store = DurableRunStore(db_path)
+        first = APIServerAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "host": "127.0.0.1",
+                    "port": self._free_port(),
+                    "key": self._KEY,
+                },
+            ),
+            durable_store=first_store,
+        )
+        second = APIServerAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "host": "127.0.0.1",
+                    "port": self._free_port(),
+                    "key": self._KEY,
+                },
+            ),
+            durable_store=second_store,
+        )
+        try:
+            assert await first.connect() is True
+            first_store.register_run(run_id="run_owned_by_first", session_id="s")
+            assert first_store.transition("run_owned_by_first", RunState.RUNNING)
+
+            # Different port does not grant a second writer authority and must
+            # not reconcile the first process's active row.
+            assert await second.connect() is False
+            assert second_store.get_run("run_owned_by_first")["status"] == "running"
+            assert second._background_tasks == set()
+
+            # OS releases the non-expiring fence when the owner closes. The
+            # same second adapter can then take over and perform reconciliation.
+            await first.disconnect()
+            assert await second.connect() is True
+            assert second_store.get_run("run_owned_by_first")["status"] == "stopped"
+        finally:
+            await first.disconnect()
+            await second.disconnect()
+            first_store.close()
+            second_store.close()

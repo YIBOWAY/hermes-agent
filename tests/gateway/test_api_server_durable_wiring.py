@@ -5,18 +5,23 @@ passes a ``durable_store`` into ``APIServerAdapter`` (``_broker_enabled()`` is
 just ``store is not None``). ``build_durable_store(config)`` is the single,
 unit-testable construction point ``gateway/run.py`` uses so the feature is
 **opt-in and default-OFF**: with no enabling config the adapter gets
-``durable_store=None`` and ``/v1/runs`` keeps its legacy in-memory behavior
-byte-identical.
+``durable_store=None`` and ``/v1/runs`` keeps its in-memory execution path.
 
 Red line: default construction must be side-effect-free (no DB file, no store)
 so installing this code never changes live behavior unless explicitly enabled.
 """
 
+import os
+from pathlib import Path
+import subprocess
+import sys
+
 import pytest
+from unittest.mock import MagicMock
 
 from gateway.config import PlatformConfig
 from gateway.durable_runs import DurableRunStore
-from gateway.platforms.api_server import build_durable_store
+from gateway.platforms.api_server import APIServerAdapter, build_durable_store
 
 _ENV_FLAG = "API_SERVER_DURABLE_RUNS"
 _ENV_DB = "API_SERVER_DURABLE_RUNS_DB"
@@ -140,3 +145,85 @@ class TestEnabled:
             assert (tmp_path / "durable_runs.db").exists()
         finally:
             _close(store)
+
+    def test_factory_fences_true_process_before_sqlite_open(self, tmp_path):
+        """A losing process cannot enable WAL/DDL before it is fenced."""
+        db_path = tmp_path / "cross-process.db"
+        config = PlatformConfig(
+            enabled=True,
+            extra={
+                "durable_runs_enabled": True,
+                "durable_runs_db": str(db_path),
+            },
+        )
+        store = build_durable_store(config, hermes_home=tmp_path)
+        try:
+            before = db_path.stat()
+            code = f"""
+import sys
+from gateway.config import PlatformConfig
+from gateway.platforms.api_server import build_durable_store
+config = PlatformConfig(enabled=True, extra={{
+    'durable_runs_enabled': True,
+    'durable_runs_db': {str(db_path)!r},
+}})
+try:
+    build_durable_store(config)
+except RuntimeError:
+    raise SystemExit(0)
+raise SystemExit(2)
+"""
+            contender = subprocess.run(
+                [sys.executable, "-c", code],
+                cwd=str(tmp_path),
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+                env={
+                    **os.environ,
+                    "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+                },
+            )
+            assert contender.returncode == 0, contender.stderr
+            after = db_path.stat()
+            assert (after.st_size, after.st_mtime_ns) == (
+                before.st_size,
+                before.st_mtime_ns,
+            )
+        finally:
+            _close(store)
+
+
+class TestDurableStoreOwnership:
+    @pytest.mark.asyncio
+    async def test_disconnect_closes_store_owned_by_adapter(self):
+        store = MagicMock()
+        adapter = APIServerAdapter(
+            PlatformConfig(enabled=True, extra={}),
+            durable_store=store,
+            owns_durable_store=True,
+        )
+
+        await adapter.disconnect()
+        await adapter.disconnect()
+
+        store.close.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_closes_store_before_releasing_authority(self):
+        order = []
+        store = MagicMock()
+        lock = MagicMock()
+        store.authority_lock = lock
+        store.close.side_effect = lambda: order.append("close")
+        lock.release.side_effect = lambda: order.append("release")
+        adapter = APIServerAdapter(
+            PlatformConfig(enabled=True, extra={}),
+            durable_store=store,
+            owns_durable_store=True,
+        )
+
+        await adapter.disconnect()
+
+        assert order == ["close", "release"]

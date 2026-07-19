@@ -104,10 +104,10 @@ async def _run_to_terminal(adapter, cli, deltas, **post_kwargs):
         run_id = (await resp.json())["run_id"]
         for _ in range(100):
             status = (await (await cli.get(f"/v1/runs/{run_id}")).json()).get("status")
-            if status in {"completed", "failed", "cancelled"}:
+            if status in {"succeeded", "failed", "stopped"}:
                 break
             await asyncio.sleep(0.05)
-        assert status == "completed"
+        assert status == "succeeded"
         return run_id
 
 
@@ -129,6 +129,87 @@ def _deltas(events):
 
 
 class TestDurableEventPersistence:
+    @pytest.mark.asyncio
+    async def test_sse_registration_lookup_failure_is_stable_503(
+        self, store, monkeypatch
+    ):
+        adapter = _make_adapter(durable_store=store)
+        store.register_run(run_id="run_sse_lookup_failure", session_id="s")
+        adapter._run_statuses["run_sse_lookup_failure"] = {
+            "run_id": "run_sse_lookup_failure",
+            "status": "running",
+        }
+        monkeypatch.setattr(
+            store,
+            "get_run",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("db unavailable")),
+        )
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            response = await cli.get(
+                "/v1/runs/run_sse_lookup_failure/events"
+            )
+            payload = await response.json()
+
+        assert response.status == 503
+        assert payload["error"]["code"] == "durable_unavailable"
+
+    @pytest.mark.asyncio
+    async def test_append_failure_emits_no_fabricated_live_event(self, store, monkeypatch):
+        adapter = _make_adapter(durable_store=store)
+        store.register_run(run_id="run_append_failure", session_id="s")
+        live_q = adapter._broker_subscribe("run_append_failure")
+        monkeypatch.setattr(
+            store,
+            "append_event",
+            lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")),
+        )
+
+        with pytest.raises(RuntimeError, match="durable event persistence failed"):
+            adapter._broker_publish(
+                "run_append_failure",
+                {"event": "message.delta", "delta": "must not leak live"},
+            )
+
+        assert live_q.empty()
+        assert adapter._run_event_seq["run_append_failure"] == 0
+
+    @pytest.mark.asyncio
+    async def test_runtime_append_failure_fails_closed_without_phantom_status(
+        self, store, monkeypatch
+    ):
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+        monkeypatch.setattr(
+            store,
+            "append_event",
+            lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")),
+        )
+
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                agent = _agent_with_deltas(["cannot-be-delivered"])
+                _capture_stream_cb(mock_create, agent)
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await response.json())["run_id"]
+                for _ in range(100):
+                    status_response = await cli.get(f"/v1/runs/{run_id}")
+                    status_payload = await status_response.json()
+                    if status_response.status == 503:
+                        break
+                    await asyncio.sleep(0.01)
+                sse_response = await cli.get(f"/v1/runs/{run_id}/events")
+                sse_payload = await sse_response.json()
+
+        assert status_response.status == 503
+        assert status_payload["error"]["code"] == "durable_unavailable"
+        assert sse_response.status == 503
+        assert sse_payload["error"]["code"] == "durable_unavailable"
+        assert store.get_run(run_id)["status"] == "running"
+        assert store.replay_events(run_id, since_seq=0) == []
+        assert agent.interrupt.called
+
     @pytest.mark.asyncio
     async def test_events_persisted_with_monotonic_seq_and_stable_ids(self, store):
         """Emitted run events land in the store with stable event_id + monotonic seq."""
@@ -169,6 +250,42 @@ class TestDurableEventPersistence:
 
 
 class TestEventCursorReplay:
+    @pytest.mark.asyncio
+    async def test_event_between_replay_and_live_subscription_is_not_lost(
+        self, store, monkeypatch
+    ):
+        run_id = "run_replay_subscribe_seam"
+        store.register_run(run_id=run_id, session_id="s")
+        adapter = _make_adapter(durable_store=store)
+        adapter._broker_seed(run_id)
+        original_replay = store.replay_events
+
+        def replay_then_publish(target_run_id, *, since_seq=0):
+            backlog = original_replay(target_run_id, since_seq=since_seq)
+            adapter._broker_publish(
+                run_id,
+                {"event": "message.delta", "delta": "at-the-seam"},
+            )
+            asyncio.get_running_loop().call_later(
+                0.01, adapter._broker_publish, run_id, None
+            )
+            return backlog
+
+        monkeypatch.setattr(store, "replay_events", replay_then_publish)
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            response = await cli.get(f"/v1/runs/{run_id}/events")
+            body = await response.text()
+
+        seam_events = [
+            event
+            for event in _sse_events(body)
+            if event.get("delta") == "at-the-seam"
+        ]
+        assert len(seam_events) == 1
+        persisted = original_replay(run_id, since_seq=0)
+        assert seam_events[0]["event_id"] == persisted[0].event_id
+
     @pytest.mark.asyncio
     async def test_replay_from_since_cursor_no_gap_no_dup(self, store):
         """?since={seq} returns only later events, ordered, no gap/dup."""

@@ -12,6 +12,8 @@ import contextvars
 import fnmatch
 import functools
 import hashlib
+import hmac
+import json
 import logging
 import os
 import re
@@ -21,7 +23,8 @@ import tempfile
 import threading
 import time
 import unicodedata
-from typing import Optional
+import uuid
+from typing import Callable, Optional
 from hermes_cli.config import cfg_get
 
 from tools.interrupt import is_interrupted
@@ -2018,6 +2021,10 @@ _session_approved: dict[str, set] = {}
 _session_yolo: set[str] = set()
 _permanent_approved: set = set()
 
+# Process-private key: approval digests are opaque capabilities, not a public
+# SHA-256 oracle over potentially low-entropy commands, tokens, or paths.
+_APPROVAL_DIGEST_KEY = os.urandom(32)
+
 # =========================================================================
 # Blocking gateway approval (mirrors CLI's synchronous input() flow)
 # =========================================================================
@@ -2027,14 +2034,70 @@ _permanent_approved: set = set()
 # resolves every pending approval in the session.
 
 
+def _approval_action_digest(
+    command: str,
+    description: str,
+    pattern_keys,
+    *,
+    approval_id: str = "",
+    tool_name: str = "",
+    args=None,
+) -> str:
+    """Return an entry-bound opaque digest of raw action identity."""
+    canonical = json.dumps(
+        {
+            "approval_id": approval_id,
+            "command": command,
+            "description": description,
+            "pattern_keys": list(pattern_keys or []),
+            "tool_name": tool_name,
+            "args": args,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    )
+    return hmac.new(
+        _APPROVAL_DIGEST_KEY,
+        canonical.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason")
+    __slots__ = (
+        "approval_id",
+        "event",
+        "data",
+        "result",
+        "reason",
+        "active",
+        "claimed",
+    )
 
     def __init__(self, data: dict):
+        data = dict(data)
+        self.approval_id = str(data.get("approval_id") or f"apr_{uuid.uuid4().hex}")
+        data["approval_id"] = self.approval_id
+        data.setdefault(
+            "action_digest",
+            _approval_action_digest(
+                str(data.get("command", "")),
+                str(data.get("description", "")),
+                data.get("pattern_keys") or [data.get("pattern_key", "")],
+                approval_id=self.approval_id,
+            ),
+        )
         self.event = threading.Event()
         self.data = data          # command, description, pattern_keys, …
         self.result: Optional[str] = None  # "once"|"session"|"always"|"deny"
+        # ``active`` is owned by the waiting thread; ``claimed`` is a short
+        # HTTP-side lease that prevents timeout/unregister races while an exact
+        # durable decision is being committed before the waiter is signalled.
+        self.active = True
+        self.claimed = False
         # Optional free-text reason supplied with an explicit deny
         # (``/deny <reason>``) so the agent can adapt instead of only
         # hearing "denied". Ported from qwibitai/nanoclaw#2832.
@@ -2072,7 +2135,8 @@ def unregister_gateway_notify(session_key: str) -> None:
 
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
-                             reason: Optional[str] = None) -> int:
+                             reason: Optional[str] = None,
+                             approval_id: Optional[str] = None) -> int:
     """Called by the gateway's /approve or /deny handler to unblock
     waiting agent thread(s).
 
@@ -2090,7 +2154,16 @@ def resolve_gateway_approval(session_key: str, choice: str,
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
-        if resolve_all:
+        if approval_id is not None:
+            target = next(
+                (entry for entry in queue if entry.approval_id == approval_id),
+                None,
+            )
+            if target is None:
+                return 0
+            queue.remove(target)
+            targets = [target]
+        elif resolve_all:
             targets = list(queue)
             queue.clear()
         else:
@@ -2106,10 +2179,97 @@ def resolve_gateway_approval(session_key: str, choice: str,
     return len(targets)
 
 
-def has_blocking_approval(session_key: str) -> bool:
+def claim_gateway_approval(
+    session_key: str, *, approval_id: str
+) -> Optional[_ApprovalEntry]:
+    """Remove one exact pending entry without releasing its waiter."""
+    with _lock:
+        queue = _gateway_queues.get(session_key)
+        if not queue:
+            return None
+        target = next(
+            (entry for entry in queue if entry.approval_id == approval_id),
+            None,
+        )
+        if (
+            target is None
+            or not target.active
+            or target.claimed
+            or target.event.is_set()
+        ):
+            return None
+        target.claimed = True
+        queue.remove(target)
+        if not queue:
+            _gateway_queues.pop(session_key, None)
+        return target
+
+
+def restore_gateway_approval_claim(
+    session_key: str, entry: _ApprovalEntry
+) -> None:
+    """Restore an unsignalled claim for identical-choice durable recovery."""
+    with _lock:
+        if not entry.active or entry.event.is_set():
+            entry.claimed = False
+            return
+        entry.claimed = False
+        queue = _gateway_queues.setdefault(session_key, [])
+        if entry not in queue:
+            queue.insert(0, entry)
+
+
+def finalize_gateway_approval_claim(
+    entry: _ApprovalEntry,
+    choice: str,
+    *,
+    reason: Optional[str] = None,
+    before_signal: Optional[Callable[[], None]] = None,
+) -> bool:
+    """Commit release intent under the claim lock, then signal the waiter.
+
+    ``before_signal`` may persist only a release commitment. It runs after the
+    exact active claim is revalidated and before ``Event.set``; it can never be
+    treated as proof that the process-local waiter was actually signalled.
+    """
+    with _lock:
+        if not entry.active or not entry.claimed or entry.event.is_set():
+            return False
+        if before_signal is not None:
+            before_signal()
+        entry.result = choice
+        if reason:
+            entry.reason = reason
+        entry.claimed = False
+        entry.event.set()
+        return True
+
+
+def abort_gateway_approval_claim(
+    entry: _ApprovalEntry,
+    *,
+    reason: str = "Approval delivery failed after durable acceptance",
+) -> None:
+    """Fail closed and release a claimed waiter without executing its action."""
+    with _lock:
+        if not entry.active or entry.event.is_set():
+            entry.claimed = False
+            return
+        entry.result = "deny"
+        entry.reason = reason
+        entry.claimed = False
+        entry.event.set()
+
+
+def has_blocking_approval(
+    session_key: str, approval_id: Optional[str] = None
+) -> bool:
     """Check if a session has one or more blocking gateway approvals waiting."""
     with _lock:
-        return bool(_gateway_queues.get(session_key))
+        queue = _gateway_queues.get(session_key) or []
+        if approval_id is None:
+            return bool(queue)
+        return any(entry.approval_id == approval_id for entry in queue)
 
 
 def submit_pending(session_key: str, approval: dict):
@@ -2645,6 +2805,7 @@ def _run_approval_gate(
     autoapprove_log_prefix: str,
     fail_closed_when_no_human: bool = False,
     no_human_block_message: str = "",
+    action_identity: Optional[dict] = None,
 ) -> dict:
     """Shared human-approval gate for a flagged action (command or tool).
 
@@ -2765,7 +2926,15 @@ def _run_approval_gate(
                 "allow_permanent": True,
             }
             decision = _await_gateway_decision(
-                session_key, notify_cb, approval_data, surface="gateway"
+                session_key,
+                notify_cb,
+                approval_data,
+                surface="gateway",
+                action_identity=action_identity or {
+                    "command": display_target,
+                    "description": description,
+                    "pattern_keys": [pattern_key],
+                },
             )
             if decision.get("notify_failed"):
                 return {
@@ -2943,6 +3112,7 @@ def request_tool_approval(
     *,
     rule_key: str = "",
     approval_callback=None,
+    args: Optional[dict] = None,
 ) -> dict:
     """Escalate an arbitrary tool call to the human-approval gate.
 
@@ -3021,6 +3191,13 @@ def request_tool_approval(
             "but no interactive user or gateway is present to approve it. "
             "A plugin flagged this action for human confirmation."
         ),
+        action_identity={
+            "command": display_target,
+            "description": description,
+            "pattern_keys": [pattern_key],
+            "tool_name": tool_name,
+            "args": dict(args or {}),
+        },
     )
 
 
@@ -3056,7 +3233,8 @@ def _format_tirith_description(tirith_result: dict) -> str:
 
 
 def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
-                            *, surface: str = "gateway") -> dict:
+                            *, surface: str = "gateway",
+                            action_identity: Optional[dict] = None) -> dict:
     """Enqueue *approval_data*, notify the user, and block the calling agent
     thread until the request is resolved or the gateway approval timeout
     elapses — firing pre/post approval hooks and cleaning up the queue entry.
@@ -3070,17 +3248,33 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     notify callback raised.  Persistence of an approved choice and building
     the final tool-facing result dict remain the caller's responsibility.
     """
+    approval_data = dict(approval_data)
     command = approval_data.get("command", "")
     description = approval_data.get("description", "")
     primary_key = approval_data.get("pattern_key", "")
     all_keys = approval_data.get("pattern_keys", [primary_key])
+    identity = action_identity or approval_data
+    approval_data["approval_id"] = str(
+        approval_data.get("approval_id") or f"apr_{uuid.uuid4().hex}"
+    )
+    approval_data["action_digest"] = _approval_action_digest(
+        str(identity.get("command", "")),
+        str(identity.get("description", "")),
+        identity.get("pattern_keys") or [identity.get("pattern_key", "")],
+        approval_id=approval_data["approval_id"],
+        tool_name=str(identity.get("tool_name", "")),
+        args=identity.get("args"),
+    )
 
     entry = _ApprovalEntry(approval_data)
+    approval_data = entry.data
     with _lock:
         _gateway_queues.setdefault(session_key, []).append(entry)
 
     def _drop_entry() -> None:
         with _lock:
+            entry.active = False
+            entry.claimed = False
             queue = _gateway_queues.get(session_key, [])
             if entry in queue:
                 queue.remove(entry)
@@ -3143,8 +3337,22 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
             break
         _remaining = _deadline - time.monotonic()
         if _remaining <= 0:
-            break
+            # An exact HTTP resolver may have claimed this entry just before
+            # timeout.  Do not let the waiter disappear after the handler has
+            # started committing its immutable decision; the claim is always
+            # either restored or finalized by that handler.
+            with _lock:
+                claimed = entry.active and entry.claimed
+            if not claimed:
+                break
+            _remaining = 1.0
         if entry.event.wait(timeout=min(1.0, _remaining)):
+            # Stop/interrupt has precedence over an approval wake-up.  Without
+            # this post-wake check, stop could land while Event.wait blocked,
+            # then an approval signal would release the dangerous action and a
+            # downstream "clean slate" clear would erase the real stop.
+            if is_interrupted():
+                entry.result = "deny"
             resolved = True
             break
         if touch_activity_if_due is not None:
@@ -3452,7 +3660,15 @@ def check_all_command_guards(command: str, env_type: str,
             if smart_denied_for_owner:
                 approval_data["smart_denied"] = True
             decision = _await_gateway_decision(
-                session_key, notify_cb, approval_data, surface="gateway"
+                session_key,
+                notify_cb,
+                approval_data,
+                surface="gateway",
+                action_identity={
+                    "command": command,
+                    "description": combined_desc,
+                    "pattern_keys": all_keys,
+                },
             )
             if decision.get("notify_failed"):
                 return {
@@ -3783,7 +3999,15 @@ def check_execute_code_guard(code: str, env_type: str,
     if smart_denied_for_owner:
         approval_data["smart_denied"] = True
     decision = _await_gateway_decision(
-        session_key, notify_cb, approval_data, surface="gateway"
+        session_key,
+        notify_cb,
+        approval_data,
+        surface="gateway",
+        action_identity={
+            "command": command,
+            "description": description,
+            "pattern_keys": [pattern_key],
+        },
     )
     if decision.get("notify_failed"):
         return {
@@ -3887,7 +4111,15 @@ def request_elicitation_consent(
         }
         try:
             decision = _await_gateway_decision(
-                session_key, notify_cb, approval_data, surface=surface,
+                session_key,
+                notify_cb,
+                approval_data,
+                surface=surface,
+                action_identity={
+                    "command": message,
+                    "description": description,
+                    "pattern_keys": ["mcp_elicitation"],
+                },
             )
         except Exception as exc:
             logger.error(

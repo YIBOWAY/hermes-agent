@@ -66,7 +66,21 @@ def store(tmp_path):
 
 def _completed_agent(tokens=(10, 5, 15)):
     mock_agent = MagicMock()
-    mock_agent.run_conversation.return_value = {"final_response": "done"}
+    mock_agent.model = "test-actual-model"
+    mock_agent.provider = "test-provider"
+    mock_agent._fallback_activated = False
+
+    def _run_with_provider_receipt(**_kwargs):
+        attempt = mock_agent._provider_attempt_callback
+        response = mock_agent._provider_response_callback
+        route = {"model": mock_agent.model, "provider": mock_agent.provider}
+        assert callable(attempt)
+        assert callable(response)
+        attempt(dict(route))
+        response(dict(route))
+        return {"final_response": "done"}
+
+    mock_agent.run_conversation.side_effect = _run_with_provider_receipt
     mock_agent.session_prompt_tokens = tokens[0]
     mock_agent.session_completion_tokens = tokens[1]
     mock_agent.session_total_tokens = tokens[2]
@@ -82,10 +96,10 @@ async def _run_to_terminal(adapter, cli, body):
         status = None
         for _ in range(100):
             status = (await (await cli.get(f"/v1/runs/{run_id}")).json()).get("status")
-            if status in {"completed", "failed", "cancelled"}:
+            if status in {"succeeded", "failed", "stopped"}:
                 break
             await asyncio.sleep(0.05)
-        assert status == "completed"
+        assert status == "succeeded"
         return run_id
 
 
@@ -126,6 +140,93 @@ class TestStoreEvidence:
 
 class TestAdapterEvidence:
     @pytest.mark.asyncio
+    async def test_create_agent_failure_does_not_counterfeit_actual_or_usage(
+        self, store
+    ):
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            with patch.object(
+                adapter, "_create_agent", side_effect=RuntimeError("create failed")
+            ):
+                response = await cli.post(
+                    "/v1/runs", json={"input": "hi", "model": "requested-only"}
+                )
+                run_id = (await response.json())["run_id"]
+                for _ in range(100):
+                    status = await cli.get(f"/v1/runs/{run_id}")
+                    body = await status.json()
+                    if body.get("status") == "failed":
+                        break
+                    await asyncio.sleep(0.01)
+
+        row = store.get_run(run_id)
+        assert json.loads(row["requested_policy"])["model"] == "requested-only"
+        assert row["actual_policy"] is None
+        assert row["fallback_reason"] is None
+        assert row["usage_json"] is None
+        assert "actual_policy" not in body
+        assert "usage" not in body
+
+    @pytest.mark.asyncio
+    async def test_corrupt_durable_evidence_returns_503(self, store):
+        run_id = "run_corrupt_evidence"
+        store.register_run(run_id=run_id, session_id="s")
+        store._conn.execute(
+            "UPDATE runs SET requested_policy = ? WHERE run_id = ?",
+            ("{not-json", run_id),
+        )
+        adapter = _make_adapter(durable_store=store)
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "queued"}
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            response = await cli.get(f"/v1/runs/{run_id}")
+            payload = await response.json()
+
+        assert response.status == 503
+        assert payload["error"]["code"] == "durable_unavailable"
+        assert "not-json" not in str(payload)
+
+    @pytest.mark.asyncio
+    async def test_pre_provider_failure_has_no_actual_policy_or_usage(self, store):
+        """Entering run_conversation is not proof that a provider responded."""
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+        mock_agent = MagicMock()
+        mock_agent.model = "configured-primary"
+        mock_agent.provider = "custom"
+        mock_agent._fallback_activated = False
+        mock_agent.run_conversation.side_effect = RuntimeError(
+            "deterministic preflight failure before execution middleware next_call"
+        )
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            with patch.object(adapter, "_create_agent", return_value=mock_agent):
+                response = await cli.post(
+                    "/v1/runs", json={"input": "hi", "model": "configured-primary"}
+                )
+                run_id = (await response.json())["run_id"]
+                body = {}
+                for _ in range(100):
+                    status = await cli.get(f"/v1/runs/{run_id}")
+                    body = await status.json()
+                    if body.get("status") == "failed":
+                        break
+                    await asyncio.sleep(0.01)
+
+        row = store.get_run(run_id)
+        assert body["status"] == "failed"
+        assert row["actual_policy"] is None
+        assert row["fallback_reason"] is None
+        assert row["usage_json"] is None
+        assert "actual_policy" not in body
+        assert "usage" not in body
+
+    @pytest.mark.asyncio
     async def test_requested_and_actual_recorded_and_surfaced(self, store):
         """A completed run records requested + actual policy + usage, surfaced via GET."""
         adapter = _make_adapter(durable_store=store)
@@ -137,11 +238,15 @@ class TestAdapterEvidence:
             assert resp.status == 200
             data = await resp.json()
 
-        assert data["status"] == "completed"
+        assert data["status"] == "succeeded"
         # requested policy preserved (the client's model field)
         assert data.get("requested_policy", {}).get("model") == "my-model"
         # usage evidence present
         assert data.get("usage", {}).get("total_tokens") == 15
+        assert data.get("actual_policy") == {
+            "model": "test-actual-model",
+            "provider": "test-provider",
+        }
 
     @pytest.mark.asyncio
     async def test_route_resolution_records_requested_route(self, store):
@@ -157,6 +262,50 @@ class TestAdapterEvidence:
         req = data.get("requested_policy", {})
         # requested captures the alias the client asked for
         assert req.get("model") == "fast"
+
+    @pytest.mark.asyncio
+    async def test_requested_route_evidence_excludes_endpoint_credentials(self, store):
+        routes = {
+            "private": {
+                "model": "private-model",
+                "provider": "private-provider",
+                "api_key": "route-secret-key",
+                "base_url": (
+                    "https://route-user:route-password@example.invalid/v1"
+                    "?access_token=route-query-secret"
+                ),
+            }
+        }
+        adapter = _make_adapter(durable_store=store, model_routes=routes)
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            run_id = await _run_to_terminal(
+                adapter, cli, {"input": "hi", "model": "private"}
+            )
+            response = await cli.get(f"/v1/runs/{run_id}")
+            response_body = await response.json()
+
+        row = store.get_run(run_id)
+        requested = json.loads(row["requested_policy"])
+        assert requested == {
+            "model": "private",
+            "route": {
+                "model": "private-model",
+                "provider": "private-provider",
+            },
+        }
+        serialized_evidence = json.dumps(
+            {"row": requested, "response": response_body}, sort_keys=True
+        )
+        for secret in (
+            "route-secret-key",
+            "route-user",
+            "route-password",
+            "route-query-secret",
+            "base_url",
+            "api_key",
+        ):
+            assert secret not in serialized_evidence
 
     @pytest.mark.asyncio
     async def test_requested_policy_immutable_after_completion(self, store):
@@ -192,7 +341,7 @@ class TestAdapterEvidence:
                 status = None
                 for _ in range(100):
                     status = (await (await cli.get(f"/v1/runs/{run_id}")).json()).get("status")
-                    if status in {"completed", "failed", "cancelled"}:
+                    if status in {"succeeded", "failed", "stopped"}:
                         break
                     await asyncio.sleep(0.05)
                 assert status == "failed"
@@ -269,10 +418,10 @@ class TestPostFallbackEvidence:
                     status = (await (await cli.get(f"/v1/runs/{run_id}")).json()).get(
                         "status"
                     )
-                    if status in {"completed", "failed", "cancelled"}:
+                    if status in {"succeeded", "failed", "stopped"}:
                         break
                     await asyncio.sleep(0.05)
-                assert status == "completed"
+                assert status == "succeeded"
 
                 resp = await cli.get(f"/v1/runs/{run_id}")
                 data = await resp.json()
@@ -286,6 +435,76 @@ class TestPostFallbackEvidence:
         reason = data.get("fallback_reason")
         assert isinstance(reason, str) and reason
         assert "fallback-y" in reason
+
+    @pytest.mark.asyncio
+    async def test_fallback_chain_secrets_never_enter_public_or_durable_evidence(
+        self, store
+    ):
+        """Configured fallback credentials are inputs, never outcome evidence."""
+        canary = "CANARY_FALLBACK_API_KEY_MUST_NOT_LEAK"
+        chain = [
+            {
+                "model": "secondary-model",
+                "provider": "secondary-provider",
+                "api_key": canary,
+                "base_url": f"https://user:{canary}@fallback.invalid/v1",
+                "key_env": f"ENV_{canary}",
+            }
+        ]
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            with (
+                patch.object(adapter, "_create_agent") as mock_create,
+                patch(
+                    "gateway.run.GatewayRunner._load_fallback_model",
+                    return_value=chain,
+                ),
+            ):
+                mock_create.return_value = self._fallback_agent(
+                    model="secondary-model",
+                    provider="secondary-provider",
+                    activated=True,
+                )
+                response = await cli.post(
+                    "/v1/runs", json={"input": "hi", "model": "primary-model"}
+                )
+                run_id = (await response.json())["run_id"]
+                for _ in range(100):
+                    status_response = await cli.get(f"/v1/runs/{run_id}")
+                    status_body = await status_response.json()
+                    if status_body.get("status") == "succeeded":
+                        break
+                    await asyncio.sleep(0.05)
+                events_response = await cli.get(f"/v1/runs/{run_id}/events")
+                events_body = await events_response.text()
+
+        row = store.get_run(run_id)
+        actual = json.loads(row["actual_policy"])
+        assert actual == {
+            "model": "secondary-model",
+            "provider": "secondary-provider",
+        }
+        assert "secondary-model" in row["fallback_reason"]
+        assert "secondary-provider" in row["fallback_reason"]
+        serialized = json.dumps(
+            {
+                "get_run": status_body,
+                "events": events_body,
+                "db_row": row,
+                "db_events": [
+                    {"event": event.event_type, "payload": event.payload}
+                    for event in store.replay_events(run_id)
+                ],
+            },
+            sort_keys=True,
+            default=str,
+        )
+        assert canary not in serialized
+        assert "fallback.invalid" not in serialized
+        assert "key_env" not in serialized
+        assert "api_key" not in serialized
+        assert "base_url" not in serialized
 
     @pytest.mark.asyncio
     async def test_no_fallback_leaves_reason_none_and_uses_agent_model(self, store):
@@ -308,7 +527,7 @@ class TestPostFallbackEvidence:
                     status = (await (await cli.get(f"/v1/runs/{run_id}")).json()).get(
                         "status"
                     )
-                    if status in {"completed", "failed", "cancelled"}:
+                    if status in {"succeeded", "failed", "stopped"}:
                         break
                     await asyncio.sleep(0.05)
 

@@ -9117,8 +9117,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("API Server: aiohttp not installed")
                 return None
             # V2.13: opt-in durable-run store. Default (disabled) -> None, so
-            # /v1/runs keeps its legacy in-memory behavior byte-identical.
-            adapter = APIServerAdapter(config, durable_store=build_durable_store(config))
+            # /v1/runs keeps its in-memory execution path.
+            durable_store = build_durable_store(config)
+            adapter = APIServerAdapter(
+                config,
+                durable_store=durable_store,
+                owns_durable_store=durable_store is not None,
+            )
             adapter.gateway_runner = self
             return adapter
 

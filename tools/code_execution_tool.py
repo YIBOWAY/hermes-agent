@@ -1068,6 +1068,18 @@ def _execute_remote(
         # Execute the script on the remote backend
         logger.info("Executing code on %s backend (task %s)...",
                      env_type, effective_task_id[:8])
+        from tools.interrupt import is_interrupted as _remote_interrupted
+
+        if _remote_interrupted():
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": "execute_code was not started because the run was stopped.",
+                    "tool_calls_made": 0,
+                    "duration_seconds": 0,
+                },
+                ensure_ascii=False,
+            )
         script_result = env.execute(
             f"cd {quoted_sandbox_dir} && {env_prefix} python3 script.py",
             timeout=timeout,
@@ -1219,15 +1231,18 @@ def execute_code(
             "duration_seconds": 0,
         }, ensure_ascii=False)
 
-    # Clean interrupt slate for a user-approved script before EITHER dispatch
-    # path spawns it: drop a stale bit that landed on this thread during the
-    # blocking approval-wait so it can't kill the just-approved run on the first
-    # poll (local _wait_for_process loop, or remote/ssh env.execute which routes
-    # through the same poll loop).  A genuine post-clear interrupt re-sets the
-    # bit and is still caught downstream.
-    if _guard.get("user_approved"):
-        from tools.interrupt import clear_current_thread_interrupt
-        clear_current_thread_interrupt()
+    from tools.interrupt import is_interrupted as _is_interrupted_before_spawn
+
+    if _is_interrupted_before_spawn():
+        return json.dumps(
+            {
+                "status": "error",
+                "error": "execute_code was not started because the run was stopped.",
+                "tool_calls_made": 0,
+                "duration_seconds": 0,
+            },
+            ensure_ascii=False,
+        )
 
     if env_type != "local":
         return _execute_remote(code, task_id, enabled_tools)
@@ -1395,6 +1410,17 @@ def execute_code(
         _child_cwd = _resolve_child_cwd(_mode, tmpdir, task_id=task_id or "")
         _script_path = os.path.join(tmpdir, "script.py")
 
+        # Last possible check at the actual local subprocess spawn seam.
+        if _is_interrupted():
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": "execute_code was not started because the run was stopped.",
+                    "tool_calls_made": 0,
+                    "duration_seconds": 0,
+                },
+                ensure_ascii=False,
+            )
         proc = subprocess.Popen(
             [_child_python, _script_path],
             cwd=_child_cwd,

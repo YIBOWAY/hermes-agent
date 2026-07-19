@@ -97,14 +97,24 @@ async def _run_to_terminal(adapter, cli, body=None):
         status = None
         for _ in range(100):
             status = (await (await cli.get(f"/v1/runs/{run_id}")).json()).get("status")
-            if status in {"completed", "failed", "cancelled"}:
+            if status in {"succeeded", "failed", "stopped"}:
                 break
             await asyncio.sleep(0.05)
-        assert status == "completed"
+        assert status == "succeeded"
         return run_id
 
 
 class TestDurableStatusTracking:
+    def test_status_projection_waits_for_durable_transition(self, store, monkeypatch):
+        store.register_run(run_id="run_transition_failure", session_id="s")
+        adapter = _make_adapter(durable_store=store)
+        monkeypatch.setattr(store, "transition", lambda *args, **kwargs: False)
+
+        with pytest.raises(RuntimeError, match="durable status"):
+            adapter._set_run_status("run_transition_failure", "running")
+
+        assert "run_transition_failure" not in adapter._run_statuses
+
     @pytest.mark.asyncio
     async def test_store_status_tracks_lifecycle_to_succeeded(self, store):
         """Store runs.status mirrors live: ends at succeeded for a completed run."""
@@ -133,7 +143,7 @@ class TestDurableStatusTracking:
                 assert stop.status == 200
                 for _ in range(100):
                     st = (await (await cli.get(f"/v1/runs/{run_id}")).json()).get("status")
-                    if st == "cancelled":
+                    if st == "stopped":
                         break
                     await asyncio.sleep(0.05)
 
@@ -143,6 +153,89 @@ class TestDurableStatusTracking:
 
 
 class TestIdempotentStop:
+    @pytest.mark.asyncio
+    async def test_stop_after_agent_registration_prevents_provider_dispatch(
+        self, store
+    ):
+        import tools.approval as approval_mod
+
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+        registered = threading.Event()
+        release_registration = threading.Event()
+        agent = _completed_agent()
+        original_register = approval_mod.register_gateway_notify
+
+        def _block_after_registration(session_key, callback):
+            original_register(session_key, callback)
+            registered.set()
+            release_registration.wait(timeout=10)
+
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            with patch.object(adapter, "_create_agent", return_value=agent), patch.object(
+                approval_mod,
+                "register_gateway_notify",
+                side_effect=_block_after_registration,
+            ):
+                started = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await started.json())["run_id"]
+                assert registered.wait(timeout=3)
+
+                stopped = await cli.post(f"/v1/runs/{run_id}/stop")
+                assert stopped.status == 200
+                release_registration.set()
+                for _ in range(100):
+                    if store.get_run(run_id)["status"] == RunState.STOPPED.value:
+                        break
+                    await asyncio.sleep(0.01)
+
+        agent.run_conversation.assert_not_called()
+        row = store.get_run(run_id)
+        assert row["status"] == RunState.STOPPED.value
+        assert row["actual_policy"] is None
+        assert row["fallback_reason"] is None
+        assert row["usage_json"] is None
+
+    @pytest.mark.asyncio
+    async def test_stop_unknown_stored_state_fails_closed_without_rewrite(self, store):
+        run_id = "run_unknown_state"
+        store.register_run(run_id=run_id, session_id="s")
+        store._conn.execute(
+            "UPDATE runs SET status = ? WHERE run_id = ?",
+            ("future_unreviewed_state", run_id),
+        )
+        store._conn.commit()
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            response = await cli.post(f"/v1/runs/{run_id}/stop")
+            body = await response.json()
+
+        assert response.status == 503
+        assert body["error"]["code"] == "run_state_invalid"
+        assert "future_unreviewed_state" not in str(body)
+        assert store.get_run(run_id)["status"] == "future_unreviewed_state"
+
+    @pytest.mark.asyncio
+    async def test_stop_store_lookup_failure_returns_durable_503(
+        self, store, monkeypatch
+    ):
+        adapter = _make_adapter(durable_store=store)
+        monkeypatch.setattr(
+            store,
+            "get_run",
+            lambda run_id: (_ for _ in ()).throw(OSError("database unavailable")),
+        )
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            response = await cli.post("/v1/runs/run_lookup_failure/stop")
+            body = await response.json()
+
+        assert response.status == 503
+        assert body["error"]["code"] == "durable_unavailable"
+
     @pytest.mark.asyncio
     async def test_stop_terminal_run_is_idempotent_not_404(self, store):
         """Stopping an already-terminal run returns the same result, not 404."""
@@ -186,6 +279,71 @@ class TestIdempotentStop:
                 assert stop.status == 200
                 mock_agent.interrupt.assert_called_once()
                 interrupted.set()
+
+    @pytest.mark.asyncio
+    async def test_live_stop_append_failure_is_503_and_does_not_claim_success(
+        self, store, monkeypatch
+    ):
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            mock_agent, ready, interrupted = _slow_agent()
+            with patch.object(adapter, "_create_agent", return_value=mock_agent):
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await response.json())["run_id"]
+                assert ready.wait(timeout=3.0)
+                original_append = store.append_event
+
+                def _fail_stop_intent(run_id_arg, event_type, payload):
+                    if event_type == "run.stop_requested":
+                        raise OSError("stop intent unavailable")
+                    return original_append(run_id_arg, event_type, payload)
+
+                monkeypatch.setattr(store, "append_event", _fail_stop_intent)
+                stopped = await cli.post(f"/v1/runs/{run_id}/stop")
+                body = await stopped.json()
+
+                assert stopped.status == 503
+                assert body["error"]["code"] == "durable_unavailable"
+                assert not any(
+                    event.event_type == "run.stop_requested"
+                    for event in store.replay_events(run_id)
+                )
+                interrupted.set()
+
+    @pytest.mark.asyncio
+    async def test_repeated_live_stop_persists_one_exact_intent(self, store):
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+        release = threading.Event()
+        ready = threading.Event()
+        agent = MagicMock()
+        agent.interrupt = MagicMock()  # deliberately does not release executor
+
+        def _run(**kwargs):
+            ready.set()
+            release.wait(timeout=10)
+            return {"final_response": "done"}
+
+        agent.run_conversation.side_effect = _run
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            with patch.object(adapter, "_create_agent", return_value=agent):
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await response.json())["run_id"]
+                assert ready.wait(timeout=3.0)
+                first = await cli.post(f"/v1/runs/{run_id}/stop")
+                second = await cli.post(f"/v1/runs/{run_id}/stop")
+                assert first.status == second.status == 200
+                intents = [
+                    event
+                    for event in store.replay_events(run_id)
+                    if event.event_type == "run.stop_requested"
+                ]
+                assert len(intents) == 1
+                release.set()
 
 
 class TestRestartReconcile:

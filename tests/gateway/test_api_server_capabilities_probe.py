@@ -13,9 +13,9 @@ advertisement *honest*:
   (schema negotiation, additive-only per the descriptor idiom) and a
   ``durable`` block.
 * Each durable capability is reported as ``{supported, grounded, evidence}``
-  where ``grounded`` is backed ONLY by a **side-effect-free read-only probe**
-  against the store (``get_run`` / ``replay_events`` / ``get_approval_challenge``
-  / ``list_non_terminal_runs``). A mutating write is NEVER used as a probe.
+  where ``grounded`` is backed by transactional write/read/CAS/state-transition
+  behavior against the store. The probe always rolls its transaction back, so
+  successful and failed probes leave no canonical rows behind.
 * A store whose schema/probe fails degrades a capability to ``grounded=False``
   (fail-closed) rather than claiming support.
 
@@ -141,9 +141,51 @@ class TestDurableProbePresent:
 
 
 class TestProbeGrounding:
+    @pytest.mark.parametrize(
+        "method_name",
+        [
+            "submit_or_get",
+            "get_run",
+            "append_event",
+            "replay_events",
+            "issue_approval_challenge",
+            "get_approval_challenge",
+            "consume_approval_with_event",
+            "transition",
+            "list_non_terminal_runs",
+            "set_requested_policy",
+            "record_run_outcome",
+            "finalize_run",
+        ],
+    )
     @pytest.mark.asyncio
-    async def test_grounded_reflects_read_only_probe_not_mere_config(self, store):
-        """grounded is backed by a real read-only round-trip, not just store-presence.
+    async def test_any_public_probe_seam_failure_is_ungrounded_and_rolled_back(
+        self, store, monkeypatch, method_name
+    ):
+        tables = ("runs", "run_events", "approval_grants")
+        before = {
+            table: store._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in tables
+        }
+
+        def _fail(*args, **kwargs):
+            raise OSError(f"{method_name} unavailable")
+
+        monkeypatch.setattr(store, method_name, _fail)
+        data = await _get_caps(_make_adapter(durable_store=store))
+
+        assert all(
+            data["durable"][cap]["grounded"] is False for cap in _DURABLE_CAPS
+        )
+        after = {
+            table: store._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in tables
+        }
+        assert after == before
+
+    @pytest.mark.asyncio
+    async def test_grounded_reflects_behavioral_probe_not_mere_config(self, store):
+        """grounded is backed by real store behavior, not just store-presence.
 
         Seeding + reading back an event through the store proves the event
         plane is genuinely durable; the probe must reflect that the store
@@ -169,7 +211,10 @@ class TestProbeGrounding:
         """
 
         class _BrokenStore:
-            """Looks like a store (present) but every read probe raises."""
+            """Looks like a store (present) but cannot run a behavioral probe."""
+
+            def probe_capabilities(self):
+                raise RuntimeError("db gone")
 
             def get_run(self, run_id):  # noqa: ANN001 - test double
                 raise RuntimeError("db gone")
@@ -194,3 +239,29 @@ class TestProbeGrounding:
             assert durable[cap]["grounded"] is False, (
                 f"{cap} must not be grounded when its probe fails"
             )
+
+    @pytest.mark.asyncio
+    async def test_readable_but_unwritable_store_is_not_grounded(self):
+        class _ReadableButUnwritableStore:
+            def get_run(self, run_id):  # noqa: ANN001
+                return None
+
+            def replay_events(self, run_id, *, since_seq=0):  # noqa: ANN001
+                return []
+
+            def get_approval_challenge(self, challenge_id):  # noqa: ANN001
+                return None
+
+            def list_non_terminal_runs(self):
+                return []
+
+            def probe_capabilities(self):
+                raise OSError("database is readable but write transaction is denied")
+
+        data = await _get_caps(
+            _make_adapter(durable_store=_ReadableButUnwritableStore())
+        )
+
+        assert all(
+            data["durable"][cap]["grounded"] is False for cap in _DURABLE_CAPS
+        )

@@ -155,6 +155,98 @@ class TestBlockingGatewayApproval:
         assert not e2.event.is_set()
         assert len(_gateway_queues[session_key]) == 1
 
+    def test_exact_approval_id_resolves_only_matching_entry(self):
+        from tools.approval import (
+            resolve_gateway_approval,
+            _ApprovalEntry,
+            _gateway_queues,
+        )
+
+        session_key = "test-exact-entry"
+        first = _ApprovalEntry({"command": "first"})
+        second = _ApprovalEntry({"command": "second"})
+        _gateway_queues[session_key] = [first, second]
+
+        count = resolve_gateway_approval(
+            session_key,
+            "once",
+            approval_id=second.approval_id,
+            resolve_all=True,
+        )
+
+        assert count == 1
+        assert second.event.is_set()
+        assert not first.event.is_set()
+        assert _gateway_queues[session_key] == [first]
+
+    def test_notified_digest_binds_raw_action_before_display_redaction(self):
+        from tools.approval import (
+            _await_gateway_decision,
+            resolve_gateway_approval,
+        )
+
+        session_key = "test-raw-action-digest"
+        notified = []
+
+        def notify(payload):
+            notified.append(dict(payload))
+            resolve_gateway_approval(
+                session_key,
+                "deny",
+                approval_id=payload["approval_id"],
+            )
+
+        display = {
+            "command": "curl -H 'Authorization: [REDACTED]'",
+            "description": "uses [REDACTED]",
+            "pattern_keys": ["network"],
+        }
+        for secret in ("Bearer first-secret", "Bearer second-secret"):
+            decision = _await_gateway_decision(
+                session_key,
+                notify,
+                display,
+                action_identity={
+                    "command": f"curl -H 'Authorization: {secret}'",
+                    "description": f"uses {secret}",
+                    "pattern_keys": ["network"],
+                },
+            )
+            assert decision["choice"] == "deny"
+
+        assert notified[0]["command"] == notified[1]["command"]
+        assert notified[0]["action_digest"] != notified[1]["action_digest"]
+        assert "first-secret" not in str(notified[0])
+        assert "second-secret" not in str(notified[1])
+
+    def test_action_digest_is_keyed_not_a_bare_sha256_oracle(self):
+        import hashlib
+        import json
+
+        from tools.approval import _ApprovalEntry
+
+        raw = {
+            "command": "curl -H 'Authorization: low-entropy-secret'",
+            "description": "network request",
+            "pattern_keys": ["network"],
+        }
+        first_entry = _ApprovalEntry(raw)
+        second_entry = _ApprovalEntry(raw)
+        first = first_entry.data["action_digest"]
+        same_entry = first_entry.data["action_digest"]
+        second = second_entry.data["action_digest"]
+        canonical = json.dumps(
+            raw,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        bare = hashlib.sha256(canonical.encode()).hexdigest()
+
+        assert first == same_entry
+        assert first != second
+        assert first != bare
+
     def test_unregister_signals_all_entries(self):
         """unregister_gateway_notify signals all waiting entries to prevent hangs."""
         from tools.approval import (

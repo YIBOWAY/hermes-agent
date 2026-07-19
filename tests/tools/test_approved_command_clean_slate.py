@@ -1,4 +1,4 @@
-"""Regression tests: a user-approved command runs from a clean interrupt slate.
+"""Regression tests: stop/interrupt takes precedence over user approval.
 
 Bug (manual approvals, the default): a user approves a scanner-flagged command,
 then hits Stop / sends a message.  `agent.interrupt()` sets the per-thread
@@ -9,9 +9,8 @@ Nothing cleared it between approval-grant and `env.execute`, so
 returned exit 130 + "[Command interrupted]" while still carrying the
 "...approved by the user." note (the 3-part signature).
 
-Fix: clear the current thread's interrupt bit once before the approved command
-spawns its child (terminal foreground; execute_code local + remote), and enrich
-the note on a genuine post-start interrupt instead of implying success.
+Fix: approval never clears a real interrupt. Both terminal and execute_code
+re-check immediately before spawn and return without invoking the executor.
 
 Invariant preserved: a genuine interrupt arriving AFTER execution starts (or
 during a retry backoff) must still SIGINT the command (exit 130); non-approved
@@ -61,17 +60,41 @@ def _wait_for_sentinel(sentinel, timeout=10.0):
 # terminal_tool
 # ---------------------------------------------------------------------------
 
-def test_approved_command_clears_stale_interrupt_bit():
-    """force=True marks the run user-approved -> the stale bit is cleared and
-    the command completes (exit 0), not killed with 130."""
+def test_approved_command_preserves_stop_and_never_starts(monkeypatch):
     set_interrupt(True)  # simulate a bit that landed during the approval-wait
     assert is_interrupted()
 
+    from tools.environments.local import LocalEnvironment
+
+    monkeypatch.setattr(
+        LocalEnvironment,
+        "execute",
+        lambda *args, **kwargs: pytest.fail("terminal executor must not run"),
+    )
     result = json.loads(tt.terminal_tool(command="sleep 0.5; echo DONE", force=True))
 
-    assert result["exit_code"] == 0, result
-    assert "DONE" in result["output"]
-    assert "[Command interrupted]" not in result["output"]
+    assert result["exit_code"] == 130, result
+    assert "DONE" not in result["output"]
+
+
+def test_terminal_stop_after_approval_before_spawn_never_calls_executor(monkeypatch):
+    from tools.environments.local import LocalEnvironment
+
+    def _approve_then_stop(*args, **kwargs):
+        set_interrupt(True)
+        return {"approved": True, "user_approved": True, "description": "danger"}
+
+    monkeypatch.setattr(tt, "_check_all_guards", _approve_then_stop)
+    monkeypatch.setattr(
+        LocalEnvironment,
+        "execute",
+        lambda *args, **kwargs: pytest.fail("terminal executor must not run"),
+    )
+
+    result = json.loads(tt.terminal_tool(command="rm -rf /tmp/example"))
+
+    assert result["exit_code"] == 130
+    assert result["status"] == "interrupted"
 
 
 def test_non_approved_command_still_interrupts_on_stale_bit(monkeypatch):
@@ -83,7 +106,7 @@ def test_non_approved_command_still_interrupts_on_stale_bit(monkeypatch):
     result = json.loads(tt.terminal_tool(command="sleep 0.5; echo DONE"))
 
     assert result["exit_code"] == 130, result
-    assert "[Command interrupted]" in result["output"]
+    assert "[Command interrupted before execution]" in result["output"]
 
 
 def test_approved_command_genuine_interrupt_after_start_still_kills(tmp_path):
@@ -185,8 +208,8 @@ def test_retry_backoff_does_not_clear_genuine_interrupt(monkeypatch):
 
     result = json.loads(tt.terminal_tool(command="sleep 1", force=True, task_id="retry-test"))
 
-    assert calls["n"] == 2, calls
-    assert calls["interrupted_at_retry"] is True, "retry must NOT re-clear a genuine interrupt"
+    assert calls["n"] == 1, calls
+    assert is_interrupted() is True
     assert result["exit_code"] == 130, result
 
 
@@ -194,8 +217,7 @@ def test_retry_backoff_does_not_clear_genuine_interrupt(monkeypatch):
 # execute_code (same root cause, its own approval-wait + spawn/poll loop)
 # ---------------------------------------------------------------------------
 
-def test_execute_code_approved_clears_stale_interrupt_bit(monkeypatch):
-    """An approved execute_code script (local path) runs from a clean slate."""
+def test_execute_code_approved_preserves_stop_and_never_starts(monkeypatch):
     from tools.code_execution_tool import execute_code
 
     monkeypatch.setattr(
@@ -205,14 +227,38 @@ def test_execute_code_approved_clears_stale_interrupt_bit(monkeypatch):
     set_interrupt(True)
     assert is_interrupted()
 
+    monkeypatch.setattr(
+        "tools.code_execution_tool.subprocess.Popen",
+        lambda *args, **kwargs: pytest.fail("execute_code subprocess must not spawn"),
+    )
     result = json.loads(execute_code(
         code='import time; time.sleep(0.5); print("CODE_DONE")',
         task_id="test-clean-slate",
     ))
 
-    assert result["status"] == "success", result
-    assert "CODE_DONE" in result["output"]
-    assert "execution interrupted" not in result["output"]
+    assert result["status"] == "error", result
+    assert "CODE_DONE" not in str(result)
+
+
+def test_execute_code_stop_after_approval_before_spawn_never_calls_popen(monkeypatch):
+    from tools.code_execution_tool import execute_code
+
+    def _approve_then_stop(*args, **kwargs):
+        set_interrupt(True)
+        return {"approved": True, "user_approved": True}
+
+    monkeypatch.setattr(
+        "tools.approval.check_execute_code_guard", _approve_then_stop
+    )
+    monkeypatch.setattr(
+        "tools.code_execution_tool.subprocess.Popen",
+        lambda *args, **kwargs: pytest.fail("execute_code subprocess must not spawn"),
+    )
+
+    result = json.loads(execute_code(code="print('never')", task_id="stop-race"))
+
+    assert result["status"] == "error"
+    assert "not started" in result["error"]
 
 
 def test_execute_code_non_approved_still_interrupts_on_stale_bit(monkeypatch):
@@ -231,12 +277,10 @@ def test_execute_code_non_approved_still_interrupts_on_stale_bit(monkeypatch):
     ))
 
     # Killed on the first poll before the script can print.
-    assert "CODE_DONE" not in result["output"], result
+    assert "CODE_DONE" not in str(result), result
 
 
-def test_execute_code_remote_clears_stale_bit(monkeypatch):
-    """The clear sits above the local/remote split, so an approved remote (ssh)
-    script also dispatches from a clean slate."""
+def test_execute_code_remote_preserves_stop_before_dispatch(monkeypatch):
     from tools import code_execution_tool as cet
 
     monkeypatch.setattr(
@@ -256,4 +300,4 @@ def test_execute_code_remote_clears_stale_bit(monkeypatch):
 
     cet.execute_code(code="print(1)", task_id="remote-clean-slate")
 
-    assert captured["interrupted"] is False, "clear must run before the remote dispatch"
+    assert "interrupted" not in captured, "stop must block remote dispatch entirely"

@@ -674,6 +674,12 @@ def init_agent(
     agent._last_activity_desc: str = "initializing"
     agent._current_tool: str | None = None
     agent._api_call_count: int = 0
+    # Optional process-local evidence seams installed by durable API runs.
+    # The attempt callback fires inside execution middleware after request
+    # preflight.  Only the response callback is authoritative for public
+    # actual-policy/usage evidence; provider exceptions have no response fact.
+    agent._provider_attempt_callback = None
+    agent._provider_response_callback = None
     # Opt-out flag for the between-turns MCP tool refresh (build_turn_context).
     # Set on internal forks (e.g. background_review) that must keep ``tools[]``
     # byte-identical to a parent for provider cache parity.

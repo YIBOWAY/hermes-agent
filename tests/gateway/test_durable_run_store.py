@@ -10,6 +10,8 @@ No live effect: every test uses a throwaway tmp_path DB file.
 
 from __future__ import annotations
 
+import sqlite3
+import threading
 import time
 
 import pytest
@@ -82,6 +84,25 @@ def test_new_run_starts_queued(store) -> None:
     assert got["status"] == RunState.QUEUED.value
     assert got["idempotency_key"] == "k-q"
     assert len(got["request_digest"]) == 64  # sha256 hex
+
+
+def test_submit_or_get_persists_resolved_session_identity(store) -> None:
+    result = store.submit_or_get(
+        idempotency_key="k-session",
+        request_body={"input": "continue", "previous_response_id": "resp_1"},
+        session_id="session_from_previous_response",
+    )
+
+    assert store.get_run(result.run_id)["session_id"] == "session_from_previous_response"
+
+
+def test_requested_policy_is_set_once_and_same_value_is_idempotent(store) -> None:
+    result = store.submit_or_get(idempotency_key="k-policy", request_body=_BODY_A)
+
+    assert store.set_requested_policy(result.run_id, {"model": "requested-a"}) is True
+    assert store.set_requested_policy(result.run_id, {"model": "requested-a"}) is True
+    assert store.set_requested_policy(result.run_id, {"model": "requested-b"}) is False
+    assert store.get_run(result.run_id)["requested_policy"] == '{"model":"requested-a"}'
 
 
 # ---------------------------------------------------------------------------
@@ -204,13 +225,270 @@ def test_append_event_to_unknown_run_rejected(store) -> None:
         store.append_event("run_nope", "run.started", {})
 
 
+def test_capability_probe_exercises_writes_and_rolls_back(store) -> None:
+    tables = ("runs", "run_events", "approval_grants")
+    before_counts = {
+        table: store._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in tables
+    }
+
+    evidence = store.probe_capabilities()
+
+    assert all(evidence.values())
+    after_counts = {
+        table: store._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in tables
+    }
+    assert after_counts == before_counts
+
+
+def test_capability_probe_uses_public_store_contract_and_outer_rollback(
+    store, monkeypatch
+) -> None:
+    """A probe cannot pass by bypassing a broken public store operation."""
+    assert isinstance(store._lock, type(threading.RLock()))
+    before = {
+        table: store._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in ("runs", "run_events", "approval_grants")
+    }
+
+    def _fail(*args, **kwargs):
+        raise OSError("public append contract unavailable")
+
+    monkeypatch.setattr(store, "append_event", _fail)
+    with pytest.raises(OSError, match="public append"):
+        store.probe_capabilities()
+
+    after = {
+        table: store._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in ("runs", "run_events", "approval_grants")
+    }
+    assert after == before
+
+
+def test_atomic_approval_decision_rolls_back_consume_when_event_append_fails(
+    store, monkeypatch
+) -> None:
+    run = store.submit_or_get(idempotency_key="k-atomic-approval", request_body=_BODY_A)
+    assert store.transition(run.run_id, RunState.RUNNING)
+    challenge = store.issue_approval_challenge(
+        run.run_id,
+        approval_id="apr_atomic",
+        action_digest="digest-atomic",
+        ttl_seconds=60,
+    )
+
+    def _fail(*args, **kwargs):
+        raise OSError("event append unavailable")
+
+    monkeypatch.setattr(store, "append_event", _fail)
+    with pytest.raises(OSError, match="event append"):
+        store.consume_approval_with_event(
+            challenge.challenge_id,
+            approval_id=challenge.approval_id,
+            action_digest=challenge.action_digest,
+            choice="once",
+        )
+
+    row = store.get_approval_challenge(challenge.challenge_id)
+    assert row is not None
+    assert row["consumed"] == 0
+    assert store.replay_events(run.run_id) == []
+
+
+def test_atomic_approval_decision_is_immutable_and_single_choice(store) -> None:
+    run = store.submit_or_get(idempotency_key="k-immutable-decision", request_body=_BODY_A)
+    assert store.transition(run.run_id, RunState.RUNNING)
+    challenge = store.issue_approval_challenge(
+        run.run_id,
+        approval_id="apr_immutable",
+        action_digest="digest-immutable",
+        ttl_seconds=60,
+    )
+
+    first = store.consume_approval_with_event(
+        challenge.challenge_id,
+        approval_id=challenge.approval_id,
+        action_digest=challenge.action_digest,
+        choice="once",
+    )
+    second = store.consume_approval_with_event(
+        challenge.challenge_id,
+        approval_id=challenge.approval_id,
+        action_digest=challenge.action_digest,
+        choice="deny",
+    )
+
+    assert first is not None
+    assert second is None
+    assert store.get_approval_challenge(challenge.challenge_id)["consumed"] == 1
+    decisions = [
+        event
+        for event in store.replay_events(run.run_id)
+        if event.event_type == "approval.decision_recorded"
+    ]
+    assert len(decisions) == 1
+    assert decisions[0].payload["choice"] == "once"
+
+
+@pytest.mark.parametrize(
+    "failed_method",
+    ["append_event", "record_run_outcome", "transition"],
+)
+def test_finalize_run_rolls_back_every_canonical_fact_on_failure(
+    store, monkeypatch, failed_method
+) -> None:
+    run = store.submit_or_get(
+        idempotency_key=f"k-finalize-{failed_method}", request_body=_BODY_A
+    )
+    assert store.transition(run.run_id, RunState.RUNNING)
+
+    def _fail(*args, **kwargs):
+        raise OSError(f"{failed_method} failed")
+
+    monkeypatch.setattr(store, failed_method, _fail)
+    with pytest.raises(OSError, match="failed"):
+        store.finalize_run(
+            run.run_id,
+            terminal_state=RunState.SUCCEEDED,
+            event_type="run.completed",
+            event_payload={"event": "run.completed", "run_id": run.run_id},
+            actual_policy={"model": "actual"},
+            usage={"total_tokens": 3},
+        )
+
+    row = store.get_run(run.run_id)
+    assert row["status"] == RunState.RUNNING.value
+    assert row["actual_policy"] is None
+    assert row["usage_json"] is None
+    assert store.replay_events(run.run_id) == []
+
+
+def test_finalize_run_is_idempotent_without_duplicate_terminal_event(store) -> None:
+    run = store.submit_or_get(idempotency_key="k-finalize-once", request_body=_BODY_A)
+    assert store.transition(run.run_id, RunState.RUNNING)
+    kwargs = {
+        "terminal_state": RunState.SUCCEEDED,
+        "event_type": "run.completed",
+        "event_payload": {"event": "run.completed", "run_id": run.run_id},
+        "actual_policy": {"model": "actual"},
+        "usage": {"total_tokens": 3},
+    }
+
+    first = store.finalize_run(run.run_id, **kwargs)
+    second = store.finalize_run(run.run_id, **kwargs)
+
+    assert first is not None
+    assert second is None
+    assert [event.event_type for event in store.replay_events(run.run_id)] == [
+        "run.completed"
+    ]
+
+
+def test_terminal_run_rejects_events_before_and_after_reopen(store, tmp_path) -> None:
+    run = store.submit_or_get(idempotency_key="k-terminal-fence", request_body=_BODY_A)
+    assert store.transition(run.run_id, RunState.RUNNING)
+    store.finalize_run(
+        run.run_id,
+        terminal_state=RunState.SUCCEEDED,
+        event_type="run.completed",
+        event_payload={"event": "run.completed", "run_id": run.run_id},
+    )
+    with pytest.raises(TerminalStateError):
+        store.append_event(run.run_id, "message.delta", {"delta": "late"})
+    store.close()
+
+    reopened = _reopen(tmp_path)
+    try:
+        with pytest.raises(TerminalStateError):
+            reopened.append_event(run.run_id, "message.delta", {"delta": "later"})
+    finally:
+        reopened.close()
+
+
+def test_terminal_run_rolls_back_approval_consume_when_decision_cannot_append(store) -> None:
+    run = store.submit_or_get(idempotency_key="k-terminal-approval", request_body=_BODY_A)
+    assert store.transition(run.run_id, RunState.RUNNING)
+    challenge = store.issue_approval_challenge(
+        run.run_id,
+        approval_id="apr_terminal",
+        action_digest="digest-terminal",
+        ttl_seconds=60,
+    )
+    assert store.transition(run.run_id, RunState.STOPPED)
+
+    assert (
+        store.consume_approval_with_event(
+            challenge.challenge_id,
+            approval_id=challenge.approval_id,
+            action_digest=challenge.action_digest,
+            choice="once",
+        )
+        is None
+    )
+
+    assert store.get_approval_challenge(challenge.challenge_id)["consumed"] == 0
+
+
+def test_stop_intent_blocks_new_approval_challenge(store) -> None:
+    run = store.submit_or_get(
+        idempotency_key="k-stop-before-challenge", request_body=_BODY_A
+    )
+    assert store.transition(run.run_id, RunState.RUNNING)
+    store.append_event(
+        run.run_id,
+        "run.stop_requested",
+        {"event": "run.stop_requested", "run_id": run.run_id},
+    )
+
+    with pytest.raises(RuntimeError, match="not stopping"):
+        store.issue_approval_challenge(
+            run.run_id,
+            approval_id="apr_too_late",
+            action_digest="digest-too-late",
+            ttl_seconds=60,
+        )
+
+    assert store._conn.execute(
+        "SELECT COUNT(*) FROM approval_grants WHERE run_id = ?", (run.run_id,)
+    ).fetchone()[0] == 0
+
+
 # ---------------------------------------------------------------------------
 # row 6: approval challenge + TTL + single-use + CAS
 # ---------------------------------------------------------------------------
 
 
+def test_existing_approval_schema_adds_exact_binding_column(tmp_path) -> None:
+    db_path = tmp_path / "pre_exact_approval.db"
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "CREATE TABLE approval_grants ("
+        " challenge_id TEXT PRIMARY KEY,"
+        " run_id TEXT NOT NULL,"
+        " action_digest TEXT NOT NULL,"
+        " expires_at REAL NOT NULL,"
+        " consumed INTEGER NOT NULL DEFAULT 0,"
+        " created_at REAL NOT NULL)"
+    )
+    connection.close()
+
+    migrated = DurableRunStore(db_path)
+    try:
+        columns = {
+            row["name"]
+            for row in migrated._conn.execute(
+                "PRAGMA table_info(approval_grants)"
+            ).fetchall()
+        }
+        assert "approval_id" in columns
+    finally:
+        migrated.close()
+
+
 def test_approval_challenge_roundtrip(store) -> None:
     r = store.submit_or_get(idempotency_key="k-appr", request_body=_BODY_A)
+    assert store.transition(r.run_id, RunState.RUNNING)
     ch = store.issue_approval_challenge(
         r.run_id, action_digest="sha256:rm-rf", ttl_seconds=60
     )
@@ -222,8 +500,32 @@ def test_approval_challenge_roundtrip(store) -> None:
     assert ok is True
 
 
+def test_approval_challenge_is_bound_to_exact_pending_entry(store) -> None:
+    run = store.submit_or_get(idempotency_key="k-exact-appr", request_body=_BODY_A)
+    assert store.transition(run.run_id, RunState.RUNNING)
+    challenge = store.issue_approval_challenge(
+        run.run_id,
+        approval_id="apr_exact",
+        action_digest="digest-exact",
+        ttl_seconds=60,
+    )
+
+    assert challenge.approval_id == "apr_exact"
+    assert store.consume_approval(
+        challenge.challenge_id,
+        approval_id="apr_other",
+        action_digest="digest-exact",
+    ) is False
+    assert store.consume_approval(
+        challenge.challenge_id,
+        approval_id="apr_exact",
+        action_digest="digest-exact",
+    ) is True
+
+
 def test_approval_is_single_use(store) -> None:
     r = store.submit_or_get(idempotency_key="k-single", request_body=_BODY_A)
+    assert store.transition(r.run_id, RunState.RUNNING)
     ch = store.issue_approval_challenge(r.run_id, action_digest="d1", ttl_seconds=60)
     assert store.consume_approval(ch.challenge_id, action_digest="d1") is True
     # second consume of the same grant must fail (single-use).
@@ -232,6 +534,7 @@ def test_approval_is_single_use(store) -> None:
 
 def test_approval_digest_mismatch_rejected(store) -> None:
     r = store.submit_or_get(idempotency_key="k-mism", request_body=_BODY_A)
+    assert store.transition(r.run_id, RunState.RUNNING)
     ch = store.issue_approval_challenge(r.run_id, action_digest="real", ttl_seconds=60)
     # a forged/different action digest must not consume the grant.
     assert store.consume_approval(ch.challenge_id, action_digest="forged") is False
@@ -242,6 +545,7 @@ def test_approval_digest_mismatch_rejected(store) -> None:
 
 def test_approval_ttl_expiry(store) -> None:
     r = store.submit_or_get(idempotency_key="k-ttl", request_body=_BODY_A)
+    assert store.transition(r.run_id, RunState.RUNNING)
     ch = store.issue_approval_challenge(r.run_id, action_digest="d", ttl_seconds=0)
     # ttl_seconds=0 => already expired.
     time.sleep(0.01)
@@ -250,6 +554,7 @@ def test_approval_ttl_expiry(store) -> None:
 
 def test_approval_grants_survive_reopen(store, tmp_path) -> None:
     r = store.submit_or_get(idempotency_key="k-ap", request_body=_BODY_A)
+    assert store.transition(r.run_id, RunState.RUNNING)
     ch = store.issue_approval_challenge(r.run_id, action_digest="dx", ttl_seconds=3600)
     cid = ch.challenge_id
     store.close()

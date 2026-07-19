@@ -32,6 +32,42 @@ def _isolate_approval_state(monkeypatch):
 
 
 class TestRequestToolApproval:
+    def test_gateway_digest_binds_exact_raw_tool_args_without_disclosure(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+        digests = []
+
+        def _notify(payload):
+            digests.append((payload["action_digest"], dict(payload)))
+            approval.resolve_gateway_approval(
+                "test-session",
+                "deny",
+                approval_id=payload["approval_id"],
+            )
+
+        approval.register_gateway_notify("test-session", _notify)
+        try:
+            request_tool_approval(
+                "write_file",
+                "sensitive write",
+                rule_key="sensitive-write",
+                args={"path": "/tmp/a", "content": "secret-one"},
+            )
+            request_tool_approval(
+                "write_file",
+                "sensitive write",
+                rule_key="sensitive-write",
+                args={"path": "/tmp/b", "content": "secret-two"},
+            )
+        finally:
+            approval.unregister_gateway_notify("test-session")
+
+        assert digests[0][0] != digests[1][0]
+        rendered = repr([payload for _, payload in digests])
+        assert "secret-one" not in rendered
+        assert "secret-two" not in rendered
     def test_session_cached_approval_short_circuits(self, monkeypatch):
         monkeypatch.setattr(approval, "is_approved", lambda sk, pk: True)
         # Should NOT prompt at all.
