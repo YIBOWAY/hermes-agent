@@ -314,6 +314,33 @@ class DurableRunStore:
 
     # -- row 1/2: idempotency key + canonical digest + submit-or-get ---------
 
+    def find_submission(
+        self,
+        *,
+        idempotency_key: str,
+        request_body: dict[str, Any],
+    ) -> Optional[SubmitResult]:
+        """Read an existing exact submission without allocating a new Run.
+
+        This preflight lets HTTP idempotency recovery bypass provider
+        concurrency admission: returning an already-existing Run is a read, not
+        new agent work.  A reused key with different canonical request bytes is
+        still an exact conflict.
+        """
+        digest = canonical_digest(request_body)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT run_id, request_digest FROM runs WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        if row["request_digest"] != digest:
+            raise ConflictError(
+                "idempotency key already used with a different request"
+            )
+        return SubmitResult(run_id=row["run_id"], created=False)
+
     def submit_or_get(
         self,
         *,
