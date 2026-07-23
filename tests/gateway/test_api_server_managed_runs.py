@@ -38,6 +38,7 @@ def _runs_app(adapter: APIServerAdapter) -> web.Application:
     app = web.Application()
     app.router.add_post("/v1/runs", adapter._handle_runs)
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
+    app.router.add_post("/api/sessions/{session_id}/fork", adapter._handle_fork_session)
     return app
 
 
@@ -242,6 +243,153 @@ async def test_managed_session_resolves_compression_tip_and_ancestor_history(
     ] == [
         {"role": "user", "content": "before compression"},
         {"role": "assistant", "content": "after compression"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_managed_fork_keeps_source_and_child_run_history_independent(
+    managed_state,
+):
+    session_db, durable_store = managed_state
+    session_db.create_session("managed-source", "api_server")
+    session_db.append_message("managed-source", "user", "shared question")
+    session_db.append_message("managed-source", "assistant", "shared answer")
+    fork_point = session_db.get_messages("managed-source")[-1]["id"]
+    adapter = _make_adapter(
+        session_db=session_db,
+        durable_store=durable_store,
+    )
+    source_capture: dict[str, object] = {}
+    child_capture: dict[str, object] = {}
+
+    with patch.object(
+        adapter,
+        "_create_agent",
+        side_effect=[
+            _completed_agent(source_capture),
+            _completed_agent(child_capture),
+        ],
+    ):
+        async with TestClient(TestServer(_runs_app(adapter))) as client:
+            fork_response = await client.post(
+                "/api/sessions/managed-source/fork",
+                json={
+                    "id": "managed-child",
+                    "preserve_source": True,
+                    "fork_point": f"message:{fork_point}",
+                },
+            )
+            assert fork_response.status == 201
+
+            session_db.append_message("managed-source", "user", "source-only context")
+            session_db.append_message("managed-child", "user", "child-only context")
+
+            source_response = await client.post(
+                "/v1/runs",
+                json={"input": "continue source", "session_id": "managed-source"},
+                headers={"Idempotency-Key": "source-turn"},
+            )
+            source_body = await source_response.json()
+            await _wait_for_run(adapter, source_body["run_id"])
+
+            child_response = await client.post(
+                "/v1/runs",
+                json={"input": "continue child", "session_id": "managed-child"},
+                headers={"Idempotency-Key": "child-turn"},
+            )
+            child_body = await child_response.json()
+            await _wait_for_run(adapter, child_body["run_id"])
+            child_replay = await client.post(
+                "/v1/runs",
+                json={"input": "continue child", "session_id": "managed-child"},
+                headers={"Idempotency-Key": "child-turn"},
+            )
+            child_replay_body = await child_replay.json()
+
+    assert source_response.status == child_response.status == child_replay.status == 202
+    assert source_body["session_id"] == "managed-source"
+    assert child_body["session_id"] == "managed-child"
+    assert child_replay_body["created"] is False
+    assert child_replay_body["run_id"] == child_body["run_id"]
+    assert child_replay_body["session_id"] == "managed-child"
+    assert [
+        {"role": item["role"], "content": item["content"]}
+        for item in source_capture["conversation_history"]
+    ] == [
+        {"role": "user", "content": "shared question"},
+        {"role": "assistant", "content": "shared answer"},
+        {"role": "user", "content": "source-only context"},
+    ]
+    assert [
+        {"role": item["role"], "content": item["content"]}
+        for item in child_capture["conversation_history"]
+    ] == [
+        {"role": "user", "content": "shared question"},
+        {"role": "assistant", "content": "shared answer"},
+        {"role": "user", "content": "child-only context"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_managed_fork_compression_history_stops_at_branch_boundary(
+    managed_state,
+):
+    session_db, durable_store = managed_state
+    session_db.create_session("managed-source", "api_server")
+    session_db.append_message("managed-source", "user", "shared question")
+    session_db.append_message("managed-source", "assistant", "shared answer")
+    fork_point = session_db.get_messages("managed-source")[-1]["id"]
+    adapter = _make_adapter(
+        session_db=session_db,
+        durable_store=durable_store,
+    )
+    captured: dict[str, object] = {}
+
+    with patch.object(
+        adapter,
+        "_create_agent",
+        return_value=_completed_agent(captured),
+    ):
+        async with TestClient(TestServer(_runs_app(adapter))) as client:
+            fork_response = await client.post(
+                "/api/sessions/managed-source/fork",
+                json={
+                    "id": "managed-child",
+                    "preserve_source": True,
+                    "fork_point": f"message:{fork_point}",
+                },
+            )
+            assert fork_response.status == 201
+
+            session_db.end_session("managed-child", "compression")
+            session_db.create_session(
+                "managed-child-tip",
+                "api_server",
+                parent_session_id="managed-child",
+            )
+            session_db.append_message(
+                "managed-child-tip",
+                "user",
+                "child context after compression",
+            )
+
+            response = await client.post(
+                "/v1/runs",
+                json={"input": "continue child", "session_id": "managed-child"},
+                headers={"Idempotency-Key": "compressed-child-turn"},
+            )
+            body = await response.json()
+            await _wait_for_run(adapter, body["run_id"])
+
+    assert response.status == 202
+    assert body["session_id"] == "managed-child-tip"
+    assert [
+        {"role": item["role"], "content": item["content"]}
+        for item in captured["conversation_history"]
+    ] == [
+        {"role": "user", "content": "shared question"},
+        {"role": "assistant", "content": "shared answer"},
+        {"role": "user", "content": "child context after compression"},
     ]
 
 
