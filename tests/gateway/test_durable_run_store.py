@@ -56,6 +56,43 @@ def test_submit_or_get_returns_same_run_for_same_identity(store) -> None:
     assert second.created is False  # recovered, not re-created
 
 
+def test_find_submission_is_read_only_exact_recovery(store) -> None:
+    assert (
+        store.find_submission(
+            idempotency_key="k-find",
+            request_body=_BODY_A,
+        )
+        is None
+    )
+    created = store.submit_or_get(
+        idempotency_key="k-find",
+        request_body=_BODY_A,
+    )
+
+    found = store.find_submission(
+        idempotency_key="k-find",
+        request_body=_BODY_A,
+    )
+
+    assert found is not None
+    assert found.run_id == created.run_id
+    assert found.created is False
+    assert store._conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+
+
+def test_find_submission_rejects_reused_key_with_different_body(store) -> None:
+    store.submit_or_get(
+        idempotency_key="k-find-conflict",
+        request_body=_BODY_A,
+    )
+
+    with pytest.raises(ConflictError):
+        store.find_submission(
+            idempotency_key="k-find-conflict",
+            request_body=_BODY_B,
+        )
+
+
 def test_submit_or_get_distinct_bodies_create_distinct_runs(store) -> None:
     a = store.submit_or_get(idempotency_key="k-a", request_body=_BODY_A)
     b = store.submit_or_get(idempotency_key="k-b", request_body=_BODY_B)

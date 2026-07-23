@@ -1085,6 +1085,12 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_event_subscribers: Dict[str, list] = {}
         self._run_event_terminal: set[str] = set()
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        # One provider turn at a time may mutate a managed Hermes Session.
+        # SessionDB is thread-safe at the SQL level, but two AIAgent instances
+        # replaying the same prefix concurrently would both append divergent
+        # continuations.  The event loop owns this map, so claim/check/release
+        # need no cross-thread lock.
+        self._managed_session_runs: Dict[str, Dict[str, str]] = {}
         # Concurrency cap shared across all agent-serving endpoints
         # (/v1/chat/completions, /v1/responses, /v1/runs). Read from
         # config.yaml gateway.api_server.max_concurrent_runs; 0 disables
@@ -2094,6 +2100,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": True,
                 "session_chat_streaming": True,
                 "session_fork": True,
+                "managed_run_sessions": True,
+                "managed_run_history_authority": "hermes_session_db",
+                "managed_session_fork_mode": "preserve_source_exact_message_cursor",
                 "admin_config_rw": False,
                 "jobs_admin": False,
                 "memory_write_api": False,
@@ -2469,7 +2478,7 @@ class APIServerAdapter(BasePlatformAdapter):
         })
 
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
-        """POST /api/sessions/{session_id}/fork — branch via current SessionDB primitives."""
+        """POST /api/sessions/{session_id}/fork — immutable, exact-cursor fork."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
@@ -2481,26 +2490,93 @@ class APIServerAdapter(BasePlatformAdapter):
         if err:
             return err
         db = self._ensure_session_db()
+
+        # A managed fork is a snapshot, not a hand-off: the external/Hermes
+        # source remains independently live and byte-for-byte unchanged.
+        fork_point = body.get("fork_point")
+        if fork_point is None:
+            return web.json_response(
+                _openai_error(
+                    "fork_point is required",
+                    code="fork_point_required",
+                ),
+                status=400,
+            )
+        if not isinstance(fork_point, str):
+            return web.json_response(
+                _openai_error(
+                    "fork_point must be an exact message:<id> cursor",
+                    code="invalid_fork_point",
+                ),
+                status=400,
+            )
+        match = re.fullmatch(r"message:([1-9][0-9]*)", fork_point)
+        if match is None:
+            return web.json_response(
+                _openai_error(
+                    "fork_point must be an exact message:<id> cursor",
+                    code="invalid_fork_point",
+                ),
+                status=400,
+            )
+        if body.get("preserve_source") is not True:
+            return web.json_response(
+                _openai_error(
+                    "managed forks require preserve_source=true",
+                    code="preserve_source_required",
+                ),
+                status=400,
+            )
+        fork_message_id = int(match.group(1))
+
+        from gateway.session import _is_path_unsafe
+
         fork_id = str(body.get("id") or body.get("session_id") or f"api_{int(time.time())}_{uuid.uuid4().hex[:8]}").strip()
-        if not fork_id or re.search(r'[\r\n\x00]', fork_id):
+        if (
+            not fork_id
+            or re.search(r'[\r\n\x00]', fork_id)
+            or _is_path_unsafe(fork_id)
+            or len(fork_id) > self._MAX_SESSION_HEADER_LEN
+        ):
             return web.json_response(_openai_error("Invalid session ID", code="invalid_session_id"), status=400)
         if db.get_session(fork_id):
             return web.json_response(_openai_error(f"Session already exists: {fork_id}", code="session_exists"), status=409)
 
-        # Match the CLI /branch semantics: mark the original as branched, then
-        # create a child session that carries the transcript forward. This uses
-        # SessionDB's native parent_session_id/end_reason visibility model rather
-        # than inventing a parallel fork store.
-        db.end_session(source_id, "branched")
-        db.create_session(
-            fork_id,
-            "api_server",
-            model=source.get("model"),
-            system_prompt=source.get("system_prompt"),
-            parent_session_id=source_id,
-        )
-        messages = db.get_messages(source_id)
-        db.replace_messages(fork_id, messages)
+        try:
+            resolved_source_id = db.resolve_resume_session_id(source_id)
+            resolved_source = db.get_session(resolved_source_id)
+            if resolved_source is None:
+                raise LookupError("resolved source session is missing")
+            source_messages = db.get_messages(resolved_source_id)
+        except Exception:
+            logger.exception(
+                "[api_server] managed fork could not read source session %s",
+                source_id,
+            )
+            return web.json_response(
+                _openai_error(
+                    "Source session history is unavailable",
+                    code="session_history_unavailable",
+                ),
+                status=503,
+            )
+
+        prefix: List[Dict[str, Any]] = []
+        found_fork_point = False
+        for message in source_messages:
+            prefix.append(message)
+            if message.get("id") == fork_message_id:
+                found_fork_point = True
+                break
+        if not found_fork_point:
+            return web.json_response(
+                _openai_error(
+                    "fork_point does not identify an active source message",
+                    code="fork_point_not_found",
+                ),
+                status=409,
+            )
+
         title = body.get("title")
         if title is None:
             base = source.get("title") or "fork"
@@ -2509,11 +2585,57 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 title = f"{base} fork"
         try:
-            db.set_session_title(fork_id, str(title))
+            # Validate before creating the child so invalid metadata cannot
+            # leave a half-created session behind.
+            title = db.sanitize_title(str(title))
         except ValueError as exc:
             return web.json_response(_openai_error(str(exc), code="invalid_title"), status=400)
-        fork = db.get_session(fork_id) or {"id": fork_id, "parent_session_id": source_id}
-        return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
+
+        try:
+            db.create_session(
+                fork_id,
+                "api_server",
+                model=resolved_source.get("model"),
+                system_prompt=resolved_source.get("system_prompt"),
+                parent_session_id=resolved_source_id,
+            )
+            db.replace_messages(fork_id, prefix)
+            db.set_session_title(fork_id, title)
+        except Exception:
+            logger.exception(
+                "[api_server] managed fork write failed for child %s",
+                fork_id,
+            )
+            try:
+                db.delete_session(fork_id)
+            except Exception:
+                logger.exception(
+                    "[api_server] failed to remove partial managed fork %s",
+                    fork_id,
+                )
+            return web.json_response(
+                _openai_error(
+                    "Managed session fork is unavailable; retry later",
+                    code="session_fork_unavailable",
+                ),
+                status=503,
+                headers={"Retry-After": "1"},
+            )
+        fork = db.get_session(fork_id) or {
+            "id": fork_id,
+            "parent_session_id": resolved_source_id,
+        }
+        return web.json_response(
+            {
+                "object": "hermes.session",
+                "session": self._session_response(fork),
+                "source_session_id": source_id,
+                "resolved_source_session_id": resolved_source_id,
+                "fork_point": fork_point,
+                "preserve_source": True,
+            },
+            status=201,
+        )
 
     @_admit_api_agent_request
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
@@ -5206,6 +5328,222 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return _callback
 
+    def _resolve_managed_run_session(
+        self,
+        requested_session_id: Any,
+    ) -> tuple[Optional[str], List[Dict[str, Any]], Optional["web.Response"]]:
+        """Resolve one caller-supplied managed Session to its durable live tip.
+
+        Hermes, not the platform client, owns transcript recovery.  A supplied
+        Session id must already exist in SessionDB; compression continuations
+        resolve to their live tip and replay includes the full root-to-tip
+        lineage.  Every read failure is fail-closed before a Run is allocated.
+        """
+        from gateway.session import _is_path_unsafe
+
+        if (
+            not isinstance(requested_session_id, str)
+            or not requested_session_id
+            or len(requested_session_id) > self._MAX_SESSION_HEADER_LEN
+            or re.search(r"[\r\n\x00]", requested_session_id)
+            or _is_path_unsafe(requested_session_id)
+        ):
+            return None, [], web.json_response(
+                _openai_error(
+                    "Invalid managed session ID",
+                    code="invalid_session_id",
+                ),
+                status=400,
+            )
+
+        db = self._ensure_session_db()
+        if db is None:
+            return None, [], web.json_response(
+                _openai_error(
+                    "Session database unavailable",
+                    code="session_db_unavailable",
+                ),
+                status=503,
+            )
+        try:
+            source = db.get_session(requested_session_id)
+        except Exception:
+            logger.exception(
+                "[api_server] managed session lookup failed for %s",
+                requested_session_id,
+            )
+            return None, [], web.json_response(
+                _openai_error(
+                    "Session database unavailable",
+                    code="session_db_unavailable",
+                ),
+                status=503,
+            )
+        if source is None:
+            return None, [], web.json_response(
+                _openai_error(
+                    f"Session not found: {requested_session_id}",
+                    code="session_not_found",
+                ),
+                status=404,
+            )
+
+        try:
+            resolved_session_id = db.resolve_resume_session_id(
+                requested_session_id
+            )
+            resolved = db.get_session(resolved_session_id)
+            if resolved is None:
+                raise LookupError("resolved session is missing")
+            if resolved.get("ended_at") is not None:
+                return None, [], web.json_response(
+                    _openai_error(
+                        "Session is ended; fork it before continuing",
+                        code="session_ended",
+                    ),
+                    status=409,
+                )
+            history = db.get_messages_as_conversation(
+                resolved_session_id,
+                include_ancestors=True,
+                repair_alternation=True,
+            )
+        except Exception:
+            logger.exception(
+                "[api_server] managed session history recovery failed for %s",
+                requested_session_id,
+            )
+            return None, [], web.json_response(
+                _openai_error(
+                    "Session history is unavailable",
+                    code="session_history_unavailable",
+                ),
+                status=503,
+            )
+        return resolved_session_id, history, None
+
+    @staticmethod
+    def _managed_idempotency_store_key(
+        managed_session_scope: str,
+        client_key: str,
+    ) -> str:
+        """Scope a client action key to one managed Session without leaking ids."""
+        scope = hashlib.sha256(
+            managed_session_scope.encode("utf-8")
+        ).hexdigest()
+        return f"managed:{scope}:{client_key}"
+
+    @staticmethod
+    def _managed_session_scope(session_id: str) -> str:
+        """Profile-qualified key for process-local managed Session ownership."""
+        profile = _api_request_profile.get() or "default"
+        return f"{profile}\x1f{session_id}"
+
+    @staticmethod
+    def _submission_headers(
+        *,
+        session_id: str,
+        gateway_session_key: Optional[str],
+    ) -> Dict[str, str]:
+        headers = {"X-Hermes-Session-Id": session_id}
+        if gateway_session_key:
+            headers["X-Hermes-Session-Key"] = gateway_session_key
+        return headers
+
+    def _durable_submission_replay_response(
+        self,
+        *,
+        run_id: str,
+        fallback_session_id: str,
+        idempotency_key: str,
+        gateway_session_key: Optional[str],
+    ) -> "web.Response":
+        """Return one canonical existing Run without creating provider work."""
+        try:
+            stored_run = self._durable_store.get_run(run_id)
+        except Exception:
+            logger.exception(
+                "[api_server] durable replay lookup failed for %s",
+                run_id,
+            )
+            return self._durable_unavailable_response()
+        if stored_run is None:
+            return self._durable_unavailable_response()
+        replay_session_id = str(
+            stored_run.get("session_id") or fallback_session_id or run_id
+        )
+        try:
+            replay_body = self._public_run_status(
+                {
+                    "run_id": run_id,
+                    "status": stored_run.get("status"),
+                    "session_id": replay_session_id,
+                    "created": False,
+                    "idempotent_replay": True,
+                    "idempotency_key": idempotency_key,
+                }
+            )
+        except ValueError:
+            return self._run_state_invalid_response(run_id)
+        return web.json_response(
+            replay_body,
+            status=202,
+            headers=self._submission_headers(
+                session_id=replay_session_id,
+                gateway_session_key=gateway_session_key,
+            ),
+        )
+
+    def _managed_session_busy_response(
+        self,
+        *,
+        managed_session_scope: str,
+        session_id: str,
+        idempotency_key: Optional[str],
+        request_body: Dict[str, Any],
+        gateway_session_key: Optional[str],
+    ) -> Optional["web.Response"]:
+        """Recover an in-flight identical submit or reject a divergent turn."""
+        claim = self._managed_session_runs.get(managed_session_scope)
+        if claim is None:
+            return None
+        if (
+            self._broker_enabled()
+            and idempotency_key is not None
+            and claim.get("idempotency_key") == idempotency_key
+        ):
+            if (
+                claim.get("request_digest")
+                != self._request_digest_for_busy_check(request_body)
+            ):
+                return web.json_response(
+                    _openai_error(
+                        "Idempotency-Key was already used with a different request",
+                        code="idempotency_conflict",
+                    ),
+                    status=409,
+                )
+            return self._durable_submission_replay_response(
+                run_id=claim["run_id"],
+                fallback_session_id=session_id,
+                idempotency_key=idempotency_key,
+                gateway_session_key=gateway_session_key,
+            )
+        return web.json_response(
+            _openai_error(
+                "Another run is already mutating this managed session",
+                code="session_busy",
+            ),
+            status=409,
+            headers={"Retry-After": "1"},
+        )
+
+    @staticmethod
+    def _request_digest_for_busy_check(request_body: Dict[str, Any]) -> str:
+        from gateway.durable_runs import canonical_digest
+
+        return canonical_digest(request_body)
+
     @_admit_api_agent_request
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs — start an agent run, return run_id immediately."""
@@ -5213,12 +5551,6 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
-
-        # Enforce concurrency limit (shared across all agent-serving
-        # endpoints; configurable via gateway.api_server.max_concurrent_runs).
-        limited = self._concurrency_limited_response()
-        if limited is not None:
-            return limited
 
         try:
             body = await request.json()
@@ -5235,52 +5567,113 @@ class APIServerAdapter(BasePlatformAdapter):
 
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
+        requested_managed_session_id = (
+            body.get("session_id") if "session_id" in body else None
+        )
 
-        # Accept explicit conversation_history from the request body.
-        # Precedence: explicit conversation_history > previous_response_id.
-        conversation_history: List[Dict[str, str]] = []
-        raw_history = body.get("conversation_history")
-        if raw_history:
-            if not isinstance(raw_history, list):
+        # A caller-supplied Session id selects the managed contract: Hermes
+        # loads its own canonical transcript.  Supplying a second transcript
+        # authority alongside it would let a platform counterfeit context, so
+        # reject that shape rather than choosing ambiguous precedence.
+        conversation_history: List[Dict[str, Any]] = []
+        stored_session_id = None
+        if requested_managed_session_id is not None:
+            if (
+                "conversation_history" in body
+                or previous_response_id is not None
+                or (isinstance(raw_input, list) and len(raw_input) > 1)
+            ):
                 return web.json_response(
-                    _openai_error("'conversation_history' must be an array of message objects"),
+                    _openai_error(
+                        "Hermes owns history for managed sessions; submit only the new input",
+                        code="managed_session_history_owned_by_hermes",
+                    ),
                     status=400,
                 )
-            for i, entry in enumerate(raw_history):
-                if not isinstance(entry, dict) or "role" not in entry or "content" not in entry:
+            (
+                resolved_session_id,
+                conversation_history,
+                session_error,
+            ) = self._resolve_managed_run_session(
+                requested_managed_session_id
+            )
+            if session_error is not None:
+                return session_error
+        else:
+            # Legacy/stateless clients may still provide explicit history or
+            # previous_response_id.  This path does not claim managed-session
+            # continuity and remains backwards compatible.
+            raw_history = body.get("conversation_history")
+            if raw_history:
+                if not isinstance(raw_history, list):
                     return web.json_response(
-                        _openai_error(f"conversation_history[{i}] must have 'role' and 'content' fields"),
+                        _openai_error(
+                            "'conversation_history' must be an array of message objects"
+                        ),
                         status=400,
                     )
-                conversation_history.append({"role": str(entry["role"]), "content": str(entry["content"])})
-            if previous_response_id:
-                logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
-
-        stored_session_id = None
-        if not conversation_history and previous_response_id:
-            stored = self._response_store.get(previous_response_id)
-            if stored:
-                conversation_history = list(stored.get("conversation_history", []))
-                stored_session_id = stored.get("session_id")
-                if instructions is None:
-                    instructions = stored.get("instructions")
-
-        # When input is a multi-message array, extract all but the last
-        # message as conversation history (the last becomes user_message).
-        # Only fires when no explicit history was provided.
-        if not conversation_history and isinstance(raw_input, list) and len(raw_input) > 1:
-            for msg in raw_input[:-1]:
-                if isinstance(msg, dict) and msg.get("role") and msg.get("content"):
-                    content = msg["content"]
-                    if isinstance(content, list):
-                        # Flatten multi-part content blocks to text
-                        content = " ".join(
-                            part.get("text", "") for part in content
-                            if isinstance(part, dict) and part.get("type") == "text"
+                for i, entry in enumerate(raw_history):
+                    if (
+                        not isinstance(entry, dict)
+                        or "role" not in entry
+                        or "content" not in entry
+                    ):
+                        return web.json_response(
+                            _openai_error(
+                                f"conversation_history[{i}] must have 'role' and 'content' fields"
+                            ),
+                            status=400,
                         )
-                    conversation_history.append({"role": msg["role"], "content": str(content)})
+                    conversation_history.append(
+                        {
+                            "role": str(entry["role"]),
+                            "content": str(entry["content"]),
+                        }
+                    )
+                if previous_response_id:
+                    logger.debug(
+                        "Both conversation_history and previous_response_id provided; using conversation_history"
+                    )
 
-        resolved_session_id = body.get("session_id") or stored_session_id
+            if not conversation_history and previous_response_id:
+                stored = self._response_store.get(previous_response_id)
+                if stored:
+                    conversation_history = list(
+                        stored.get("conversation_history", [])
+                    )
+                    stored_session_id = stored.get("session_id")
+                    if instructions is None:
+                        instructions = stored.get("instructions")
+
+            # When input is a multi-message array, extract all but the last
+            # message as conversation history (the last becomes user_message).
+            if (
+                not conversation_history
+                and isinstance(raw_input, list)
+                and len(raw_input) > 1
+            ):
+                for msg in raw_input[:-1]:
+                    if (
+                        isinstance(msg, dict)
+                        and msg.get("role")
+                        and msg.get("content")
+                    ):
+                        content = msg["content"]
+                        if isinstance(content, list):
+                            content = " ".join(
+                                part.get("text", "")
+                                for part in content
+                                if isinstance(part, dict)
+                                and part.get("type") == "text"
+                            )
+                        conversation_history.append(
+                            {
+                                "role": msg["role"],
+                                "content": str(content),
+                            }
+                        )
+
+            resolved_session_id = stored_session_id
 
         # V2.2 (contract matrix §2 rows 1/2): honor the caller's Idempotency-Key
         # with a durable submit-or-get against the canonical request digest.
@@ -5299,12 +5692,79 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 status=400,
             )
+
+        managed_session = requested_managed_session_id is not None
+        managed_session_scope = (
+            self._managed_session_scope(str(resolved_session_id))
+            if managed_session
+            else None
+        )
+        if managed_session:
+            busy_response = self._managed_session_busy_response(
+                managed_session_scope=str(managed_session_scope),
+                session_id=str(resolved_session_id),
+                idempotency_key=idempotency_key,
+                request_body=body,
+                gateway_session_key=gateway_session_key,
+            )
+            if busy_response is not None:
+                return busy_response
+
+        idempotency_store_key = idempotency_key
+        if managed_session and idempotency_key is not None:
+            idempotency_store_key = self._managed_idempotency_store_key(
+                self._managed_session_scope(
+                    str(requested_managed_session_id)
+                ),
+                idempotency_key,
+            )
+
+        # Read-only exact recovery precedes provider concurrency admission.  A
+        # completed Run replay remains available while another Session occupies
+        # the last provider slot; it neither allocates a row nor starts work.
+        if idempotency_key is not None and self._durable_store is not None:
+            from gateway.durable_runs import ConflictError
+
+            try:
+                existing_submit = self._durable_store.find_submission(
+                    idempotency_key=str(idempotency_store_key),
+                    request_body=body,
+                )
+            except ConflictError:
+                return web.json_response(
+                    _openai_error(
+                        "Idempotency-Key was already used with a different request",
+                        code="idempotency_conflict",
+                    ),
+                    status=409,
+                )
+            except Exception:
+                logger.exception(
+                    "[api_server] durable submission preflight failed"
+                )
+                return self._durable_unavailable_response()
+            if existing_submit is not None:
+                return self._durable_submission_replay_response(
+                    run_id=existing_submit.run_id,
+                    fallback_session_id=str(
+                        resolved_session_id or existing_submit.run_id
+                    ),
+                    idempotency_key=idempotency_key,
+                    gateway_session_key=gateway_session_key,
+                )
+
+        # Only a genuinely new provider turn consumes concurrency.  Idempotent
+        # recovery returned above is control-plane read work, not agent work.
+        limited = self._concurrency_limited_response()
+        if limited is not None:
+            return limited
+
         if idempotency_key is not None and self._durable_store is not None:
             from gateway.durable_runs import ConflictError
 
             try:
                 submit = self._durable_store.submit_or_get(
-                    idempotency_key=idempotency_key,
+                    idempotency_key=str(idempotency_store_key),
                     request_body=body,
                     session_id=resolved_session_id,
                 )
@@ -5328,40 +5788,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             if not submit.created:
                 # Recovery: return the existing Run; never re-spawn it.
-                response_headers = (
-                    {"X-Hermes-Session-Key": gateway_session_key}
-                    if gateway_session_key
-                    else {}
-                )
-                try:
-                    stored_run = self._durable_store.get_run(submit.run_id)
-                except Exception:
-                    logger.exception(
-                        "[api_server] durable replay lookup failed for %s",
-                        submit.run_id,
-                    )
-                    return self._durable_unavailable_response()
-                if stored_run is None:
-                    return self._durable_unavailable_response()
-                try:
-                    replay_body = self._public_run_status({
-                        "run_id": submit.run_id,
-                        "status": stored_run.get("status"),
-                        "idempotent_replay": True,
-                        "idempotency_key": idempotency_key,
-                    })
-                except ValueError:
-                    return self._run_state_invalid_response(submit.run_id)
-                return web.json_response(
-                    replay_body,
-                    status=202,
-                    headers=response_headers,
+                return self._durable_submission_replay_response(
+                    run_id=submit.run_id,
+                    fallback_session_id=str(
+                        resolved_session_id or submit.run_id
+                    ),
+                    idempotency_key=idempotency_key,
+                    gateway_session_key=gateway_session_key,
                 )
             run_id = submit.run_id
             session_id = resolved_session_id or run_id
+            submission_created = True
         else:
             run_id = f"run_{uuid.uuid4().hex}"
             session_id = resolved_session_id or run_id
+            submission_created = True
         # Ensure a durable run row exists whenever the broker is active so
         # events/approvals have a parent (contract row 9). Keyed submissions were
         # already persisted by submit_or_get; this registers server-minted runs.
@@ -5424,11 +5865,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._stop_unadmitted_durable_run(run_id)
                 return self._durable_unavailable_response()
 
+        if managed_session:
+            self._managed_session_runs[str(managed_session_scope)] = {
+                "run_id": run_id,
+                "idempotency_key": idempotency_key or "",
+                "request_digest": self._request_digest_for_busy_check(body),
+            }
+
         # Approval queues gate host-side tool execution and must be isolated
-        # per API run.  Client-provided session IDs and memory session keys are
-        # conversation/memory scopes, not authorization namespaces: multiple
-        # concurrent runs can intentionally share them, and resolving an
-        # approval for one run must not unblock another run's dangerous command.
+        # per API run.  Managed Session turns are serialized above; approval
+        # identity is still the Run because control decisions must never leak
+        # between distinct runs or non-managed clients sharing another scope.
         approval_session_key = run_id
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
@@ -5502,6 +5949,12 @@ class APIServerAdapter(BasePlatformAdapter):
             self._active_run_tasks.pop(run_id, None)
             self._stopping_run_ids.discard(run_id)
             self._stop_intent_run_ids.discard(run_id)
+            claim = self._managed_session_runs.get(str(managed_session_scope))
+            if claim is not None and claim.get("run_id") == run_id:
+                self._managed_session_runs.pop(
+                    str(managed_session_scope),
+                    None,
+                )
             return self._durable_unavailable_response()
 
         # Background task outlives the HTTP response (and thus the middleware
@@ -5854,6 +6307,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._run_approval_sessions.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
                 self._stop_intent_run_ids.discard(run_id)
+                claim = self._managed_session_runs.get(
+                    str(managed_session_scope)
+                )
+                if claim is not None and claim.get("run_id") == run_id:
+                    self._managed_session_runs.pop(
+                        str(managed_session_scope),
+                        None,
+                    )
 
         self._activate_admitted_request()
         task = asyncio.create_task(_run_and_close())
@@ -5865,13 +6326,18 @@ class APIServerAdapter(BasePlatformAdapter):
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
 
-        response_headers = (
-            {"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {}
-        )
         return web.json_response(
-            {"run_id": run_id, "status": "queued"},
+            {
+                "run_id": run_id,
+                "session_id": session_id,
+                "created": submission_created,
+                "status": "queued",
+            },
             status=202,
-            headers=response_headers,
+            headers=self._submission_headers(
+                session_id=str(session_id),
+                gateway_session_key=gateway_session_key,
+            ),
         )
 
     async def _handle_get_run(self, request: "web.Request") -> "web.Response":

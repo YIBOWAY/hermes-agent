@@ -314,6 +314,10 @@ class TestRunStatus:
 
     @pytest.mark.asyncio
     async def test_status_reflects_explicit_session_id(self, adapter):
+        adapter._ensure_session_db().create_session(
+            "space-session",
+            "api_server",
+        )
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             with patch.object(adapter, "_create_agent") as mock_create:
@@ -448,7 +452,10 @@ class TestRunEvents:
 
     @pytest.mark.asyncio
     async def test_approval_resolve_all_is_scoped_to_target_run(self, auth_adapter):
-        """Same client session_id must not let one run approve another run's queue."""
+        """A shared long-memory client scope cannot cross-approve two runs."""
+        session_db = auth_adapter._ensure_session_db()
+        session_db.create_session("victim-session", "api_server")
+        session_db.create_session("attacker-session", "api_server")
         app = _create_runs_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:
             with patch.object(auth_adapter, "_create_agent") as mock_create:
@@ -458,13 +465,19 @@ class TestRunEvents:
 
                 victim_resp = await cli.post(
                     "/v1/runs",
-                    json={"input": "victim", "session_id": "shared-project"},
-                    headers={"Authorization": "Bearer sk-secret"},
+                    json={"input": "victim", "session_id": "victim-session"},
+                    headers={
+                        "Authorization": "Bearer sk-secret",
+                        "X-Hermes-Session-Key": "shared-project",
+                    },
                 )
                 attacker_resp = await cli.post(
                     "/v1/runs",
-                    json={"input": "attacker", "session_id": "shared-project"},
-                    headers={"Authorization": "Bearer sk-secret"},
+                    json={"input": "attacker", "session_id": "attacker-session"},
+                    headers={
+                        "Authorization": "Bearer sk-secret",
+                        "X-Hermes-Session-Key": "shared-project",
+                    },
                 )
                 assert victim_resp.status == 202
                 assert attacker_resp.status == 202

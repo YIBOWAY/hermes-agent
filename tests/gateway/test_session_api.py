@@ -64,6 +64,12 @@ async def test_capabilities_advertises_session_control_surface(adapter):
     assert features["session_chat"] is True
     assert features["session_chat_streaming"] is True
     assert features["session_fork"] is True
+    assert features["managed_run_sessions"] is True
+    assert features["managed_run_history_authority"] == "hermes_session_db"
+    assert (
+        features["managed_session_fork_mode"]
+        == "preserve_source_exact_message_cursor"
+    )
     assert features["admin_config_rw"] is False
     assert features["memory_write_api"] is False
     assert features["skills_api"] is True
@@ -190,15 +196,25 @@ async def test_session_messages_follow_compression_tip(adapter, session_db):
 
 
 @pytest.mark.asyncio
-async def test_session_fork_uses_current_sessiondb_branch_primitives(adapter, session_db):
+async def test_session_fork_preserves_source_and_copies_exact_prefix(adapter, session_db):
     source_id = session_db.create_session("source-session", "api_server", model="test-model")
     session_db.set_session_title(source_id, "Original")
     session_db.append_message(source_id, "user", "first path")
     session_db.append_message(source_id, "assistant", "answer")
+    fork_point = session_db.get_messages(source_id)[0]["id"]
+    source_before = session_db.get_session(source_id)
+    messages_before = session_db.get_messages(source_id)
 
     app = _create_session_app(adapter)
     async with TestClient(TestServer(app)) as cli:
-        resp = await cli.post(f"/api/sessions/{source_id}/fork", json={"title": "Alternative"})
+        resp = await cli.post(
+            f"/api/sessions/{source_id}/fork",
+            json={
+                "title": "Alternative",
+                "preserve_source": True,
+                "fork_point": f"message:{fork_point}",
+            },
+        )
         assert resp.status == 201
         payload = await resp.json()
 
@@ -207,8 +223,79 @@ async def test_session_fork_uses_current_sessiondb_branch_primitives(adapter, se
     assert fork["id"] != source_id
     assert fork["parent_session_id"] == source_id
     assert fork["title"] == "Alternative"
-    assert [m["content"] for m in session_db.get_messages(fork["id"])] == ["first path", "answer"]
-    assert session_db.get_session(source_id)["end_reason"] == "branched"
+    assert payload["source_session_id"] == source_id
+    assert payload["fork_point"] == f"message:{fork_point}"
+    assert payload["preserve_source"] is True
+    assert [m["content"] for m in session_db.get_messages(fork["id"])] == ["first path"]
+    assert session_db.get_session(source_id) == source_before
+    assert session_db.get_messages(source_id) == messages_before
+
+
+@pytest.mark.asyncio
+async def test_session_fork_requires_exact_message_cursor(adapter, session_db):
+    source_id = session_db.create_session("source-session", "api_server")
+    session_db.append_message(source_id, "user", "first path")
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        missing = await cli.post(f"/api/sessions/{source_id}/fork", json={})
+        malformed = await cli.post(
+            f"/api/sessions/{source_id}/fork",
+            json={"fork_point": "cursor:latest", "preserve_source": True},
+        )
+        nonexistent = await cli.post(
+            f"/api/sessions/{source_id}/fork",
+            json={"fork_point": "message:999999", "preserve_source": True},
+        )
+        missing_body = await missing.json()
+        malformed_body = await malformed.json()
+        nonexistent_body = await nonexistent.json()
+
+    assert missing.status == 400
+    assert missing_body["error"]["code"] == "fork_point_required"
+    assert malformed.status == 400
+    assert malformed_body["error"]["code"] == "invalid_fork_point"
+    assert nonexistent.status == 409
+    assert nonexistent_body["error"]["code"] == "fork_point_not_found"
+    assert session_db.get_session(source_id)["ended_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_session_fork_write_failure_removes_partial_child_and_preserves_source(
+    adapter,
+    session_db,
+    monkeypatch,
+):
+    source_id = session_db.create_session("source-session", "api_server")
+    session_db.append_message(source_id, "user", "first path")
+    message_id = session_db.get_messages(source_id)[0]["id"]
+    source_before = session_db.get_session(source_id)
+    messages_before = session_db.get_messages(source_id)
+
+    monkeypatch.setattr(
+        session_db,
+        "replace_messages",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError("database write failed")
+        ),
+    )
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            f"/api/sessions/{source_id}/fork",
+            json={
+                "id": "partial-child",
+                "preserve_source": True,
+                "fork_point": f"message:{message_id}",
+            },
+        )
+        body = await response.json()
+
+    assert response.status == 503
+    assert body["error"]["code"] == "session_fork_unavailable"
+    assert session_db.get_session("partial-child") is None
+    assert session_db.get_session(source_id) == source_before
+    assert session_db.get_messages(source_id) == messages_before
 
 
 @pytest.mark.asyncio
