@@ -2596,6 +2596,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 fork_id,
                 "api_server",
                 model=resolved_source.get("model"),
+                # Keep the same stable branch marker used by Hermes' native
+                # /branch command. parent_session_id alone is ambiguous with
+                # a compression continuation, so resume resolution would
+                # otherwise redirect future source reads/runs into this fork.
+                #
+                # Do not clone the source's opaque model_config wholesale:
+                # it can contain unrelated lineage/delegation metadata. The
+                # effective model and system prompt are inherited explicitly.
+                model_config={"_branched_from": resolved_source_id},
                 system_prompt=resolved_source.get("system_prompt"),
                 parent_session_id=resolved_source_id,
             )
@@ -5403,11 +5412,30 @@ class APIServerAdapter(BasePlatformAdapter):
                     ),
                     status=409,
                 )
-            history = db.get_messages_as_conversation(
-                resolved_session_id,
-                include_ancestors=True,
-                repair_alternation=True,
-            )
+            # A managed fork stores an exact transcript prefix in its own row.
+            # Walking every parent_session_id ancestor would therefore replay
+            # the source prefix twice. Compression continuations are the only
+            # ancestors whose separate message segments belong to this live
+            # conversation, and SessionDB already owns that distinction.
+            lineage = db.get_compression_lineage(resolved_session_id)
+            if not lineage:
+                raise LookupError("resolved session lineage is unavailable")
+            history = []
+            for lineage_session_id in lineage:
+                history.extend(
+                    db.get_messages_as_conversation(lineage_session_id)
+                )
+            if history:
+                from agent.agent_runtime_helpers import repair_message_sequence
+
+                repaired = repair_message_sequence(None, history)
+                if repaired:
+                    logger.info(
+                        "Repaired %d message-alternation violation(s) while "
+                        "restoring managed session %s",
+                        repaired,
+                        resolved_session_id,
+                    )
         except Exception:
             logger.exception(
                 "[api_server] managed session history recovery failed for %s",

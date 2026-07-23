@@ -218,7 +218,19 @@ async def test_session_fork_preserves_source_and_copies_exact_prefix(adapter, se
         assert resp.status == 201
         payload = await resp.json()
 
-    fork = payload["session"]
+        fork = payload["session"]
+        assert session_db.get_session(source_id) == source_before
+        assert session_db.get_messages(source_id) == messages_before
+        session_db.append_message(source_id, "user", "source continues")
+        session_db.append_message(fork["id"], "user", "fork continues")
+
+        source_messages_resp = await cli.get(f"/api/sessions/{source_id}/messages")
+        fork_messages_resp = await cli.get(f"/api/sessions/{fork['id']}/messages")
+        assert source_messages_resp.status == 200
+        assert fork_messages_resp.status == 200
+        source_messages_payload = await source_messages_resp.json()
+        fork_messages_payload = await fork_messages_resp.json()
+
     assert payload["object"] == "hermes.session"
     assert fork["id"] != source_id
     assert fork["parent_session_id"] == source_id
@@ -226,9 +238,17 @@ async def test_session_fork_preserves_source_and_copies_exact_prefix(adapter, se
     assert payload["source_session_id"] == source_id
     assert payload["fork_point"] == f"message:{fork_point}"
     assert payload["preserve_source"] is True
-    assert [m["content"] for m in session_db.get_messages(fork["id"])] == ["first path"]
-    assert session_db.get_session(source_id) == source_before
-    assert session_db.get_messages(source_id) == messages_before
+    assert source_messages_payload["session_id"] == source_id
+    assert [m["content"] for m in source_messages_payload["data"]] == [
+        "first path",
+        "answer",
+        "source continues",
+    ]
+    assert fork_messages_payload["session_id"] == fork["id"]
+    assert [m["content"] for m in fork_messages_payload["data"]] == [
+        "first path",
+        "fork continues",
+    ]
 
 
 @pytest.mark.asyncio
