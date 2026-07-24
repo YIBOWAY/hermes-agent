@@ -52,6 +52,7 @@ import logging
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import time
 import uuid
@@ -128,6 +129,96 @@ def _hermes_version() -> str:
         return __version__
     except Exception:
         return "dev"
+
+
+def _runtime_build_identity() -> Dict[str, Any]:
+    """Capture the code identity this process actually booted from.
+
+    The result is frozen by ``APIServerAdapter.__init__``.  Re-reading the
+    checkout on every capability request would let an old process masquerade
+    as newly reviewed code after the worktree moved.  Local Agent v0.2 release
+    admission accepts only a clean git worktree identity and compares it with
+    the independently inspected runtime root.
+    """
+
+    module_path = Path(__file__).resolve()
+    candidate_root = module_path.parents[2]
+    base: Dict[str, Any] = {
+        "schema_version": 1,
+        "source": "unavailable",
+        "ready": False,
+        "root_realpath": str(candidate_root),
+        "module_realpath": str(module_path),
+        "entrypoint_sha256": hashlib.sha256(module_path.read_bytes()).hexdigest(),
+    }
+    try:
+        resolved = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(candidate_root),
+                "rev-parse",
+                "--show-toplevel",
+                "HEAD",
+                "HEAD^{tree}",
+            ],
+            check=True,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        lines = resolved.stdout.splitlines()
+        if len(lines) != 3:
+            raise ValueError("unexpected git identity output")
+        root_realpath = str(Path(lines[0]).resolve())
+        commit = lines[1].strip().lower()
+        tree = lines[2].strip().lower()
+        if (
+            re.fullmatch(r"[0-9a-f]{40,64}", commit) is None
+            or re.fullmatch(r"[0-9a-f]{40,64}", tree) is None
+            or root_realpath != str(candidate_root)
+        ):
+            raise ValueError("invalid git identity")
+        status = subprocess.run(
+            [
+                "git",
+                "-C",
+                root_realpath,
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ],
+            check=True,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        clean = not status.stdout
+        base.update(
+            {
+                "source": "git_worktree",
+                "ready": clean,
+                "root_realpath": root_realpath,
+                "commit": commit,
+                "tree": tree,
+                "clean": clean,
+            }
+        )
+    except Exception:
+        # Capabilities must remain observable even when git is unavailable.
+        # Release admission treats this bounded, secret-free state as not ready.
+        base["reason"] = "build_identity_unavailable"
+
+    digest_input = json.dumps(
+        base,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    base["digest"] = hashlib.sha256(digest_input).hexdigest()
+    return base
 
 
 # Default settings
@@ -1047,6 +1138,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "+00:00", "Z"
             )
         )
+        self._runtime_build_identity = _runtime_build_identity()
         # model_routes: maps incoming ``model`` field values to specific
         # provider/model configs so one API server instance can serve
         # multiple clients on different backends.
@@ -1653,6 +1745,18 @@ class APIServerAdapter(BasePlatformAdapter):
     # durable store's primary key with a multi-kilobyte "key".  256 chars is far
     # above any realistic idempotency token (a UUID is 36).
     _MAX_IDEMPOTENCY_KEY_LEN = 256
+    _PLATFORM_RUN_CONTEXT_SOURCE = "platform.hqa_hermes_run_port"
+    _PLATFORM_RUN_CONTEXT_KEYS = frozenset(
+        {
+            "command_id",
+            "kind",
+            "client_request_id",
+            "platform_session_id",
+            "canonical_request_digest",
+            "payload_ref",
+            "source",
+        }
+    )
 
     def _parse_session_key_header(
         self, request: "web.Request"
@@ -1705,6 +1809,95 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         return raw, None
+
+    @classmethod
+    def _parse_platform_run_context(
+        cls,
+        body: Dict[str, Any],
+        *,
+        managed_session: bool,
+    ) -> tuple[Dict[str, str], Optional["web.Response"]]:
+        """Validate the bounded ai-quant-platform context for a managed Run.
+
+        The context is exposed only as per-turn subprocess environment for
+        local skills.  It is deliberately not appended to the system prompt:
+        managed-session prompt prefixes must remain byte-stable across turns.
+        These values are selectors, not authority; HQA/platform must re-check
+        them against their canonical command and Run stores.
+        """
+
+        metadata = body.get("metadata")
+        if not isinstance(metadata, dict) or metadata.get("source") != (
+            cls._PLATFORM_RUN_CONTEXT_SOURCE
+        ):
+            return {}, None
+        if not managed_session:
+            return {}, web.json_response(
+                _openai_error(
+                    "Platform Run context requires a managed Hermes Session",
+                    code="platform_context_requires_managed_session",
+                ),
+                status=400,
+            )
+        if frozenset(metadata) != cls._PLATFORM_RUN_CONTEXT_KEYS:
+            return {}, web.json_response(
+                _openai_error(
+                    "Platform Run context has an invalid field set",
+                    code="invalid_platform_run_context",
+                ),
+                status=400,
+            )
+
+        bounded_fields = {
+            "command_id": 256,
+            "kind": 128,
+            "client_request_id": 256,
+            "platform_session_id": 256,
+        }
+        for field, max_len in bounded_fields.items():
+            value = metadata.get(field)
+            if (
+                type(value) is not str
+                or not value
+                or len(value) > max_len
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]*", value) is None
+            ):
+                return {}, web.json_response(
+                    _openai_error(
+                        "Platform Run context is invalid",
+                        code="invalid_platform_run_context",
+                    ),
+                    status=400,
+                )
+
+        canonical_digest = metadata.get("canonical_request_digest")
+        payload_ref = metadata.get("payload_ref")
+        if (
+            type(canonical_digest) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", canonical_digest) is None
+            or type(payload_ref) is not str
+            or re.fullmatch(
+                r"(?:"
+                r"payload:sha256:"
+                r"|hqa-payload:sha256:"
+                r"|platform-payload://sha256/"
+                r")[0-9a-f]{64}",
+                payload_ref,
+            )
+            is None
+        ):
+            return {}, web.json_response(
+                _openai_error(
+                    "Platform Run context is invalid",
+                    code="invalid_platform_run_context",
+                ),
+                status=400,
+            )
+
+        return {
+            "command_id": str(metadata["command_id"]),
+            "platform_session_id": str(metadata["platform_session_id"]),
+        }, None
 
     # ------------------------------------------------------------------
     # Session DB helper
@@ -2092,6 +2285,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "split_runtime": False,
                 "instance_id": self._runtime_instance_id,
                 "started_at": self._runtime_started_at,
+                "pid": os.getpid(),
+                "build": dict(self._runtime_build_identity),
                 "description": (
                     "The API server creates a server-side Hermes AIAgent; "
                     "tools execute on the API-server host unless a future "
@@ -4788,6 +4983,10 @@ class APIServerAdapter(BasePlatformAdapter):
         chat_id: str = "",
         session_key: str = "",
         session_id: str = "",
+        platform_command_id: str = "",
+        platform_session_id: str = "",
+        platform_run_id: str = "",
+        platform_managed_session_id: str = "",
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -4812,6 +5011,10 @@ class APIServerAdapter(BasePlatformAdapter):
             session_key=session_key,
             session_id=session_id,
             async_delivery=False,
+            platform_command_id=platform_command_id,
+            platform_session_id=platform_session_id,
+            platform_run_id=platform_run_id,
+            platform_managed_session_id=platform_managed_session_id,
         )
 
     async def _run_agent(
@@ -5737,6 +5940,15 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         managed_session = requested_managed_session_id is not None
+        (
+            platform_run_context,
+            platform_context_error,
+        ) = self._parse_platform_run_context(
+            body,
+            managed_session=managed_session,
+        )
+        if platform_context_error is not None:
+            return platform_context_error
         managed_session_scope = (
             self._managed_session_scope(str(resolved_session_id))
             if managed_session
@@ -6191,6 +6403,21 @@ class APIServerAdapter(BasePlatformAdapter):
                             approval_token = set_current_session_key(approval_session_key)
                             session_tokens = self._bind_api_server_session(
                                 session_key=approval_session_key,
+                                session_id=str(session_id),
+                                platform_command_id=platform_run_context.get(
+                                    "command_id", ""
+                                ),
+                                platform_session_id=platform_run_context.get(
+                                    "platform_session_id", ""
+                                ),
+                                platform_run_id=(
+                                    run_id if platform_run_context else ""
+                                ),
+                                platform_managed_session_id=(
+                                    str(session_id)
+                                    if platform_run_context
+                                    else ""
+                                ),
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
                             if run_id in self._stopping_run_ids:

@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import stat
+import subprocess
 import time
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -31,6 +32,7 @@ from gateway.platforms.api_server import (
     _IdempotencyCache,
     _derive_chat_session_id,
     _redact_api_error_text,
+    _runtime_build_identity,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
@@ -985,6 +987,10 @@ class TestCapabilitiesEndpoint:
             assert len(data["runtime"]["instance_id"]) == 32
             assert set(data["runtime"]["instance_id"]) <= set("0123456789abcdef")
             assert data["runtime"]["started_at"].endswith("Z")
+            assert data["runtime"]["pid"] == os.getpid()
+            assert data["runtime"]["build"]["schema_version"] == 1
+            assert len(data["runtime"]["build"]["digest"]) == 64
+            assert len(data["runtime"]["build"]["entrypoint_sha256"]) == 64
             assert "API-server host" in data["runtime"]["description"]
             assert data["features"]["chat_completions"] is True
             assert data["features"]["run_status"] is True
@@ -1016,6 +1022,85 @@ class TestCapabilitiesEndpoint:
         assert first["runtime"]["instance_id"] == repeated["runtime"]["instance_id"]
         assert first["runtime"]["started_at"] == repeated["runtime"]["started_at"]
         assert restarted["runtime"]["instance_id"] != first["runtime"]["instance_id"]
+
+    @pytest.mark.asyncio
+    async def test_capabilities_freezes_build_identity_at_adapter_boot(self):
+        boot_identity = {
+            "schema_version": 1,
+            "source": "git_worktree",
+            "ready": True,
+            "root_realpath": "/reviewed/hermes",
+            "module_realpath": "/reviewed/hermes/gateway/platforms/api_server.py",
+            "entrypoint_sha256": "a" * 64,
+            "commit": "b" * 40,
+            "tree": "c" * 40,
+            "clean": True,
+            "digest": "d" * 64,
+        }
+        moved_identity = dict(
+            boot_identity,
+            commit="e" * 40,
+            tree="f" * 40,
+            digest="1" * 64,
+        )
+        with patch(
+            "gateway.platforms.api_server._runtime_build_identity",
+            return_value=boot_identity,
+        ) as identity_probe:
+            adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+            identity_probe.return_value = moved_identity
+            async with TestClient(TestServer(_create_app(adapter))) as cli:
+                observed = await (await cli.get("/v1/capabilities")).json()
+
+        assert observed["runtime"]["build"] == boot_identity
+        identity_probe.assert_called_once_with()
+
+    def test_runtime_build_identity_reports_real_clean_then_dirty_checkout(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        root = tmp_path / "hermes"
+        module = root / "gateway" / "platforms" / "api_server.py"
+        module.parent.mkdir(parents=True)
+        module.write_text("BUILD = 1\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "-c",
+                "user.name=Hermes Test",
+                "-c",
+                "user.email=hermes@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "fixture",
+            ],
+            check=True,
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.api_server.__file__",
+            str(module),
+        )
+
+        clean = _runtime_build_identity()
+        module.write_text("BUILD = 2\n", encoding="utf-8")
+        dirty = _runtime_build_identity()
+
+        assert clean["source"] == "git_worktree"
+        assert clean["ready"] is True
+        assert clean["clean"] is True
+        assert clean["root_realpath"] == str(root)
+        assert clean["commit"] == dirty["commit"]
+        assert clean["tree"] == dirty["tree"]
+        assert clean["entrypoint_sha256"] != dirty["entrypoint_sha256"]
+        assert dirty["ready"] is False
+        assert dirty["clean"] is False
+        assert clean["digest"] != dirty["digest"]
 
     @pytest.mark.asyncio
     async def test_capabilities_requires_auth_when_key_configured(self, auth_adapter):

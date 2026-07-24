@@ -62,6 +62,44 @@ def _completed_agent(captured: dict[str, object]) -> MagicMock:
     return agent
 
 
+def _platform_metadata() -> dict[str, str]:
+    return {
+        "command_id": "command-7",
+        "kind": "conversation.turn",
+        "client_request_id": "request-9",
+        "platform_session_id": "platform-session-5",
+        "canonical_request_digest": "a" * 64,
+        "payload_ref": "platform-payload://sha256/" + ("b" * 64),
+        "source": "platform.hqa_hermes_run_port",
+    }
+
+
+@pytest.mark.parametrize(
+    "payload_ref",
+    [
+        "payload:sha256:" + ("b" * 64),
+        "hqa-payload:sha256:" + ("b" * 64),
+        "platform-payload://sha256/" + ("b" * 64),
+    ],
+)
+def test_platform_run_context_accepts_all_canonical_payload_ref_surfaces(
+    payload_ref,
+):
+    metadata = _platform_metadata()
+    metadata["payload_ref"] = payload_ref
+
+    context, error = APIServerAdapter._parse_platform_run_context(
+        {"metadata": metadata},
+        managed_session=True,
+    )
+
+    assert error is None
+    assert context == {
+        "command_id": "command-7",
+        "platform_session_id": "platform-session-5",
+    }
+
+
 async def _wait_for_run(adapter: APIServerAdapter, run_id: str) -> None:
     task = adapter._active_run_tasks.get(run_id)
     if task is not None:
@@ -117,6 +155,156 @@ async def test_existing_session_recovers_history_without_client_history(managed_
             {"role": "user", "content": "CONTEXT_ALPHA=7319"},
             {"role": "assistant", "content": "I will remember it."},
         ]
+
+
+@pytest.mark.asyncio
+async def test_platform_run_context_reaches_only_current_managed_run_environment(
+    managed_state,
+):
+    session_db, durable_store = managed_state
+    session_db.create_session("web_managed_1", "api_server")
+    adapter = _make_adapter(
+        session_db=session_db,
+        durable_store=durable_store,
+    )
+    captured: dict[str, object] = {}
+    agent = MagicMock()
+
+    def _run_conversation(*, user_message, conversation_history, task_id):
+        from gateway.session_context import get_session_env
+        from tools.environments.local import _inject_session_context_env
+
+        child_env: dict[str, str] = {}
+        _inject_session_context_env(child_env)
+        captured.update(
+            {
+                "user_message": user_message,
+                "task_id": task_id,
+                "command_id": get_session_env("HERMES_PLATFORM_COMMAND_ID"),
+                "platform_session_id": get_session_env(
+                    "HERMES_PLATFORM_SESSION_ID"
+                ),
+                "platform_run_id": get_session_env("HERMES_PLATFORM_RUN_ID"),
+                "managed_session_id": get_session_env(
+                    "HERMES_PLATFORM_MANAGED_SESSION_ID"
+                ),
+                "child_env": child_env,
+            }
+        )
+        return {"final_response": "done"}
+
+    agent.run_conversation.side_effect = _run_conversation
+    agent.session_prompt_tokens = 0
+    agent.session_completion_tokens = 0
+    agent.session_total_tokens = 0
+
+    with patch.object(adapter, "_create_agent", return_value=agent) as create_agent:
+        async with TestClient(TestServer(_runs_app(adapter))) as client:
+            response = await client.post(
+                "/v1/runs",
+                json={
+                    "input": "Keep the transcript natural.",
+                    "session_id": "web_managed_1",
+                    "metadata": _platform_metadata(),
+                },
+                headers={"Idempotency-Key": "platform-turn-1"},
+            )
+            body = await response.json()
+            await _wait_for_run(adapter, body["run_id"])
+
+    assert response.status == 202
+    assert captured["user_message"] == "Keep the transcript natural."
+    assert captured["task_id"] == "web_managed_1"
+    assert captured["command_id"] == "command-7"
+    assert captured["platform_session_id"] == "platform-session-5"
+    assert captured["platform_run_id"] == body["run_id"]
+    assert captured["managed_session_id"] == "web_managed_1"
+    assert captured["child_env"] == {
+        "HERMES_SESSION_PLATFORM": "api_server",
+        "HERMES_SESSION_SOURCE": "",
+        "HERMES_SESSION_CHAT_ID": "",
+        "HERMES_SESSION_CHAT_NAME": "",
+        "HERMES_SESSION_THREAD_ID": "",
+        "HERMES_SESSION_USER_ID": "",
+        "HERMES_SESSION_USER_NAME": "",
+        "HERMES_SESSION_KEY": body["run_id"],
+        "HERMES_SESSION_ID": "web_managed_1",
+        "HERMES_UI_SESSION_ID": "",
+        "HERMES_SESSION_MESSAGE_ID": "",
+        "HERMES_SESSION_PROFILE": "",
+        "HERMES_PLATFORM_COMMAND_ID": "command-7",
+        "HERMES_PLATFORM_SESSION_ID": "platform-session-5",
+        "HERMES_PLATFORM_RUN_ID": body["run_id"],
+        "HERMES_PLATFORM_MANAGED_SESSION_ID": "web_managed_1",
+    }
+    assert create_agent.call_args.kwargs["ephemeral_system_prompt"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda metadata: metadata.pop("command_id"),
+        lambda metadata: metadata.__setitem__("extra", "not-allowed"),
+        lambda metadata: metadata.__setitem__(
+            "canonical_request_digest", "not-a-digest"
+        ),
+        lambda metadata: metadata.__setitem__("payload_ref", "payload:unbound"),
+    ],
+)
+async def test_claimed_platform_run_context_is_strict_and_allocates_nothing(
+    managed_state,
+    mutate,
+):
+    session_db, durable_store = managed_state
+    session_db.create_session("web_managed_1", "api_server")
+    adapter = _make_adapter(
+        session_db=session_db,
+        durable_store=durable_store,
+    )
+    metadata = _platform_metadata()
+    mutate(metadata)
+
+    with patch.object(adapter, "_create_agent") as create_agent:
+        async with TestClient(TestServer(_runs_app(adapter))) as client:
+            response = await client.post(
+                "/v1/runs",
+                json={
+                    "input": "hello",
+                    "session_id": "web_managed_1",
+                    "metadata": metadata,
+                },
+                headers={"Idempotency-Key": "invalid-platform-context"},
+            )
+            body = await response.json()
+
+    assert response.status == 400
+    assert body["error"]["code"] == "invalid_platform_run_context"
+    assert durable_store._conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+    create_agent.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_platform_run_context_requires_managed_session(managed_state):
+    session_db, durable_store = managed_state
+    adapter = _make_adapter(
+        session_db=session_db,
+        durable_store=durable_store,
+    )
+
+    with patch.object(adapter, "_create_agent") as create_agent:
+        async with TestClient(TestServer(_runs_app(adapter))) as client:
+            response = await client.post(
+                "/v1/runs",
+                json={"input": "hello", "metadata": _platform_metadata()},
+                headers={"Idempotency-Key": "unmanaged-platform-context"},
+            )
+            body = await response.json()
+
+    assert response.status == 400
+    assert body["error"]["code"] == "platform_context_requires_managed_session"
+    assert durable_store._conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+    create_agent.assert_not_called()
 
 
 @pytest.mark.asyncio

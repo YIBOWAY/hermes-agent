@@ -93,6 +93,25 @@ _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", defaul
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 
+# Safe, non-secret identity supplied by the ai-quant-platform managed Run
+# contract.  These selectors let a local Hermes skill invoke the platform/HQA
+# CLI against the exact command that commissioned the current turn without
+# mutating the system prompt (and therefore without breaking prompt caching).
+# They are convenience context only: downstream authorities must revalidate
+# every value against their canonical stores.
+_PLATFORM_COMMAND_ID: ContextVar = ContextVar(
+    "HERMES_PLATFORM_COMMAND_ID", default=_UNSET
+)
+_PLATFORM_SESSION_ID: ContextVar = ContextVar(
+    "HERMES_PLATFORM_SESSION_ID", default=_UNSET
+)
+_PLATFORM_RUN_ID: ContextVar = ContextVar(
+    "HERMES_PLATFORM_RUN_ID", default=_UNSET
+)
+_PLATFORM_MANAGED_SESSION_ID: ContextVar = ContextVar(
+    "HERMES_PLATFORM_MANAGED_SESSION_ID", default=_UNSET
+)
+
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
 #
@@ -133,6 +152,10 @@ _VAR_MAP = {
     "HERMES_UI_SESSION_ID": _SESSION_UI_SESSION_ID,
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
     "HERMES_SESSION_PROFILE": _SESSION_PROFILE,
+    "HERMES_PLATFORM_COMMAND_ID": _PLATFORM_COMMAND_ID,
+    "HERMES_PLATFORM_SESSION_ID": _PLATFORM_SESSION_ID,
+    "HERMES_PLATFORM_RUN_ID": _PLATFORM_RUN_ID,
+    "HERMES_PLATFORM_MANAGED_SESSION_ID": _PLATFORM_MANAGED_SESSION_ID,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
@@ -169,6 +192,10 @@ def set_session_vars(
     cwd: str = "",
     async_delivery: bool = True,
     ui_session_id: str = "",
+    platform_command_id: str = "",
+    platform_session_id: str = "",
+    platform_run_id: str = "",
+    platform_managed_session_id: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -203,6 +230,10 @@ def set_session_vars(
         _SESSION_UI_SESSION_ID.set(ui_session_id),
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
+        _PLATFORM_COMMAND_ID.set(platform_command_id),
+        _PLATFORM_SESSION_ID.set(platform_session_id),
+        _PLATFORM_RUN_ID.set(platform_run_id),
+        _PLATFORM_MANAGED_SESSION_ID.set(platform_managed_session_id),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
     ]
     try:
@@ -238,6 +269,10 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_UI_SESSION_ID,
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
+        _PLATFORM_COMMAND_ID,
+        _PLATFORM_SESSION_ID,
+        _PLATFORM_RUN_ID,
+        _PLATFORM_MANAGED_SESSION_ID,
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a
