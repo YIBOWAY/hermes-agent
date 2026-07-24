@@ -46,6 +46,7 @@ import hmac
 import json
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
+from datetime import UTC, datetime
 from functools import wraps
 import logging
 import os
@@ -1034,6 +1035,17 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         self._model_name: str = self._resolve_model_name(
             extra.get("model_name", os.getenv("API_SERVER_MODEL_NAME", "")),
+        )
+        # A non-secret, per-adapter boot identity lets authenticated control
+        # planes prove that a later capability observation came from a fresh
+        # API-server instance.  It is intentionally random instead of a PID or
+        # filesystem-derived value, and remains stable for this adapter's
+        # lifetime.
+        self._runtime_instance_id = uuid.uuid4().hex
+        self._runtime_started_at = (
+            datetime.now(UTC).isoformat(timespec="microseconds").replace(
+                "+00:00", "Z"
+            )
         )
         # model_routes: maps incoming ``model`` field values to specific
         # provider/model configs so one API server instance can serve
@@ -2078,6 +2090,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "mode": "server_agent",
                 "tool_execution": "server",
                 "split_runtime": False,
+                "instance_id": self._runtime_instance_id,
+                "started_at": self._runtime_started_at,
                 "description": (
                     "The API server creates a server-side Hermes AIAgent; "
                     "tools execute on the API-server host unless a future "
