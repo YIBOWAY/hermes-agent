@@ -866,6 +866,9 @@ class TestCapabilitiesEndpoint:
             assert data["runtime"]["mode"] == "server_agent"
             assert data["runtime"]["tool_execution"] == "server"
             assert data["runtime"]["split_runtime"] is False
+            assert len(data["runtime"]["instance_id"]) == 32
+            assert set(data["runtime"]["instance_id"]) <= set("0123456789abcdef")
+            assert data["runtime"]["started_at"].endswith("Z")
             assert "API-server host" in data["runtime"]["description"]
             assert data["features"]["chat_completions"] is True
             assert data["features"]["run_status"] is True
@@ -881,6 +884,39 @@ class TestCapabilitiesEndpoint:
             assert data["endpoints"]["skills"] == {"method": "GET", "path": "/v1/skills"}
             assert data["endpoints"]["toolsets"] == {"method": "GET", "path": "/v1/toolsets"}
 
+    @pytest.mark.asyncio
+    async def test_capabilities_runtime_identity_is_stable_per_adapter_and_fresh_per_boot(
+        self,
+    ):
+        first_adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+        first_app = _create_app(first_adapter)
+        async with TestClient(TestServer(first_app)) as cli:
+            first = await (await cli.get("/v1/capabilities")).json()
+            repeated = await (await cli.get("/v1/capabilities")).json()
+
+        second_adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+        second_app = _create_app(second_adapter)
+        async with TestClient(TestServer(second_app)) as cli:
+            restarted = await (await cli.get("/v1/capabilities")).json()
+
+        assert first["runtime"]["instance_id"] == repeated["runtime"]["instance_id"]
+        assert first["runtime"]["started_at"] == repeated["runtime"]["started_at"]
+        assert restarted["runtime"]["instance_id"] != first["runtime"]["instance_id"]
+
+    @pytest.mark.asyncio
+    async def test_capabilities_requires_auth_when_key_configured(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/capabilities")
+            assert resp.status == 401
+
+            authed = await cli.get(
+                "/v1/capabilities",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert authed.status == 200
+            data = await authed.json()
+            assert data["auth"]["required"] is True
 
 # ---------------------------------------------------------------------------
 # /v1/skills and /v1/toolsets endpoints
@@ -2869,4 +2905,3 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
-
