@@ -11,6 +11,7 @@ pwd = pytest.importorskip("pwd")
 grp = pytest.importorskip("grp")
 
 import hermes_cli.gateway as gateway_cli
+import gateway.config as gateway_config
 from gateway import status
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
@@ -619,6 +620,121 @@ class TestGatewayStopCleanup:
 
 
 class TestLaunchdServiceRecovery:
+    def test_configured_api_server_endpoint_uses_effective_config(self, monkeypatch):
+        monkeypatch.setattr(
+            gateway_config,
+            "load_gateway_config",
+            lambda: SimpleNamespace(
+                platforms={
+                    gateway_config.Platform.API_SERVER: SimpleNamespace(
+                        enabled=True,
+                        extra={"host": "::", "port": 9001},
+                    )
+                }
+            ),
+        )
+
+        assert gateway_cli._configured_api_server_endpoint() == ("::", 9001)
+
+    def test_configured_api_server_endpoint_supports_nested_gateway_platforms(
+        self, tmp_path, monkeypatch
+    ):
+        (tmp_path / "config.yaml").write_text(
+            "gateway:\n"
+            "  platforms:\n"
+            "    api_server:\n"
+            "      enabled: true\n"
+            "      extra:\n"
+            "        host: 127.0.0.1\n"
+            "        port: 9123\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(gateway_config, "get_hermes_home", lambda: tmp_path)
+        for key in (
+            "API_SERVER_ENABLED",
+            "API_SERVER_HOST",
+            "API_SERVER_KEY",
+            "API_SERVER_PORT",
+        ):
+            monkeypatch.delenv(key, raising=False)
+
+        assert gateway_cli._configured_api_server_endpoint() == (
+            "127.0.0.1",
+            9123,
+        )
+
+    def test_configured_api_server_endpoint_supports_legacy_top_level_keys(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            gateway_config,
+            "load_gateway_config",
+            lambda: SimpleNamespace(platforms={}),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "read_raw_config",
+            lambda: {
+                "API_SERVER_ENABLED": True,
+                "API_SERVER_HOST": "0.0.0.0",
+                "API_SERVER_KEY": "configured-secret",
+                "API_SERVER_PORT": "8765",
+            },
+        )
+
+        endpoint = gateway_cli._configured_api_server_endpoint()
+
+        assert endpoint == ("0.0.0.0", 8765)
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda **kwargs: 654)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_gateway_runtime_status_for_pid",
+            lambda pid: {
+                "pid": pid,
+                "gateway_state": "running",
+                "platforms": {
+                    "api_server": {
+                        "state": "fatal",
+                        "error_code": "api_server_port_in_use",
+                        "error_message": "Port 8765 already in use",
+                        "updated_at": "after",
+                    }
+                },
+            },
+        )
+        assert gateway_cli._wait_for_launchd_gateway_ready(
+            previous_pid=321,
+            api_endpoint=endpoint,
+            previous_api_marker=("connected", None, "before"),
+            timeout=1.0,
+        ) == (False, 654, "Port 8765 already in use")
+
+    def test_configured_api_server_endpoint_is_absent_when_disabled(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            gateway_config,
+            "load_gateway_config",
+            lambda: SimpleNamespace(
+                platforms={
+                    gateway_config.Platform.API_SERVER: SimpleNamespace(
+                        enabled=False,
+                        extra={},
+                    )
+                }
+            ),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "read_raw_config",
+            lambda: {
+                "API_SERVER_ENABLED": True,
+                "API_SERVER_KEY": "stale-legacy-secret",
+            },
+        )
+
+        assert gateway_cli._configured_api_server_endpoint() is None
+
     def test_get_restart_drain_timeout_prefers_env_then_config_then_default(self, monkeypatch):
         monkeypatch.delenv("HERMES_RESTART_DRAIN_TIMEOUT", raising=False)
         monkeypatch.setattr(gateway_cli, "read_raw_config", lambda: {})
@@ -843,41 +959,51 @@ class TestLaunchdServiceRecovery:
             ["launchctl", "kickstart", target],
         ]
 
-    def test_launchd_restart_drains_running_gateway_before_kickstart(self, monkeypatch, capsys):
+    def test_launchd_restart_graceful_handoff_does_not_kickstart(
+        self, monkeypatch, capsys
+    ):
         calls = []
-        target = f"{gateway_cli._launchd_domain()}/{gateway_cli.get_launchd_label()}"
 
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 12.0)
         monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
-        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda timeout, force_after=None: True)
-        monkeypatch.setattr(gateway_cli, "terminate_pid", lambda pid, force=False: calls.append(("term", pid, force)))
+        monkeypatch.setattr(gateway_cli, "_configured_api_server_endpoint", lambda: None)
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
+        monkeypatch.setattr(gateway_cli, "_launchctl_label_registered", lambda label: True)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_graceful_restart_via_sigusr1",
+            lambda pid, timeout: calls.append(("graceful", pid, timeout)) or True,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_launchd_gateway_ready",
+            lambda **kwargs: (True, 654, ""),
+        )
         monkeypatch.setattr(
             "gateway.status.get_running_pid",
             lambda: 321,
         )
-
-        def fake_run(cmd, check=False, **kwargs):
-            calls.append(cmd)
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("graceful KeepAlive handoff must not kickstart")
+            ),
+        )
 
         gateway_cli.launchd_restart()
 
-        assert calls == [
-            ("term", 321, False),
-            ["launchctl", "kickstart", "-k", target],
-        ]
-        # The drain can silently hold for the full budget (180s default); the
-        # desktop updater streams this output as its only progress feedback,
-        # so the stop must be announced BEFORE the wait (#44515).
+        assert calls == [("graceful", 321, 17.0)]
         out = capsys.readouterr().out
         assert "draining in-flight runs" in out
         assert "up to 12s" in out
+        assert "Service restarted (PID 654)" in out
 
     def test_launchd_restart_self_requests_graceful_restart_without_kickstart(self, monkeypatch, capsys):
         calls = []
 
+        monkeypatch.setattr(gateway_cli, "_configured_api_server_endpoint", lambda: None)
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
         monkeypatch.setattr(
             "gateway.status.get_running_pid",
             lambda: 321,
@@ -1102,23 +1228,33 @@ class TestLaunchdServiceRecovery:
         assert gateway_cli._launchd_unsupported_marker_exists()
 
     def test_launchd_restart_falls_back_to_detached_on_error_5(self, monkeypatch, capsys):
-        """kickstart -k error 5 (domain unmanageable) should relaunch detached."""
-        target = f"{gateway_cli._launchd_domain()}/{gateway_cli.get_launchd_label()}"
+        """bootstrap error 125 (domain unmanageable) should relaunch detached."""
 
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 5.0)
         monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
-        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda timeout, force_after=None: True)
+        monkeypatch.setattr(gateway_cli, "_configured_api_server_endpoint", lambda: None)
+        monkeypatch.setattr(gateway_cli, "_launchctl_label_registered", lambda label: False)
+        monkeypatch.setattr(
+            gateway_cli, "_graceful_restart_via_sigusr1", lambda pid, timeout: True
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_launchd_gateway_ready",
+            lambda **kwargs: (True, 654, ""),
+        )
         monkeypatch.setattr(gateway_cli, "terminate_pid", lambda pid, force=False: None)
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: 321)
-
-        def fake_run(cmd, check=False, **kwargs):
-            if cmd == ["launchctl", "kickstart", "-k", target]:
-                raise gateway_cli.subprocess.CalledProcessError(
-                    5, cmd, stderr="Input/output error"
+        monkeypatch.setattr(
+            gateway_cli,
+            "_launchctl_bootstrap",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                gateway_cli.subprocess.CalledProcessError(
+                    125,
+                    ["launchctl", "bootstrap"],
+                    stderr="Domain does not support specified action",
                 )
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+            ),
+        )
 
         spawned = []
         monkeypatch.setattr(
@@ -1130,45 +1266,251 @@ class TestLaunchdServiceRecovery:
         assert spawned == [True]
         assert gateway_cli._launchd_unsupported_marker_exists()
 
-    def test_launchd_restart_boots_out_stale_registration_before_bootstrap(
+    def test_launchd_restart_unregistered_gateway_bootstraps_once_after_drain(
         self, tmp_path, monkeypatch
     ):
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
         label = gateway_cli.get_launchd_label()
         domain = gateway_cli._launchd_domain()
-        target = f"{domain}/{label}"
 
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 5.0)
         monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
+        monkeypatch.setattr(gateway_cli, "_configured_api_server_endpoint", lambda: None)
+        monkeypatch.setattr(gateway_cli, "_launchctl_label_registered", lambda name: False)
         monkeypatch.setattr(
-            gateway_cli, "_wait_for_gateway_exit", lambda timeout, force_after=None: True
+            gateway_cli, "_graceful_restart_via_sigusr1", lambda pid, timeout: True
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_launchd_gateway_ready",
+            lambda **kwargs: (True, 654, ""),
         )
         monkeypatch.setattr(gateway_cli, "terminate_pid", lambda pid, force=False: None)
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: 321)
 
         calls = []
+        monkeypatch.setattr(
+            gateway_cli,
+            "_launchctl_bootstrap",
+            lambda *args, **kwargs: calls.append((args, kwargs)),
+        )
 
-        def fake_run(cmd, check=False, **kwargs):
-            if cmd and cmd[0] == "launchctl":
-                calls.append(cmd)
-            if cmd == ["launchctl", "kickstart", "-k", target]:
-                raise gateway_cli.subprocess.CalledProcessError(
-                    3, cmd, stderr="Could not find service"
-                )
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        gateway_cli.launchd_restart()
 
-        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+        assert calls == [((domain, plist_path, label), {"timeout": 30})]
+
+    def test_launchd_restart_forces_only_original_pid_after_graceful_timeout(
+        self, monkeypatch, capsys
+    ):
+        calls = []
+
+        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 5.0)
+        monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
+        monkeypatch.setattr(gateway_cli, "_configured_api_server_endpoint", lambda: None)
+        monkeypatch.setattr(gateway_cli, "_launchctl_label_registered", lambda label: True)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_graceful_restart_via_sigusr1",
+            lambda pid, timeout: calls.append(("graceful", pid, timeout)) or False,
+        )
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: True)
+        monkeypatch.setattr(
+            gateway_cli,
+            "terminate_pid",
+            lambda pid, force=False: calls.append(("term", pid, force)),
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_wait_for_specific_pid_exit", lambda pid, timeout: True
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_launchd_gateway_ready",
+            lambda **kwargs: (True, 654, ""),
+        )
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 321)
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("registered timeout fallback must not kickstart -k")
+            ),
+        )
 
         gateway_cli.launchd_restart()
 
         assert calls == [
-            ["launchctl", "kickstart", "-k", target],
-            ["launchctl", "bootout", target],
-            ["launchctl", "bootstrap", domain, str(plist_path)],
-            ["launchctl", "kickstart", target],
+            ("graceful", 321, 10.0),
+            ("term", 321, True),
         ]
+        assert "stopping only original PID 321" in capsys.readouterr().out
+
+    def test_launchd_restart_timeout_race_never_kills_replacement(
+        self, monkeypatch
+    ):
+        calls = []
+
+        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 5.0)
+        monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
+        monkeypatch.setattr(gateway_cli, "_configured_api_server_endpoint", lambda: None)
+        monkeypatch.setattr(gateway_cli, "_launchctl_label_registered", lambda label: True)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_graceful_restart_via_sigusr1",
+            lambda pid, timeout: False,
+        )
+        # The old PID disappears immediately after the graceful helper's final
+        # sample; launchd has already produced replacement A.
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "terminate_pid",
+            lambda pid, force=False: calls.append(("term", pid, force)),
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_wait_for_specific_pid_exit", lambda pid, timeout: True
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_launchd_gateway_ready",
+            lambda **kwargs: (True, 654, ""),
+        )
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 321)
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *args, **kwargs: calls.append(("launchctl", args, kwargs)),
+        )
+
+        gateway_cli.launchd_restart()
+
+        assert calls == []
+
+    def test_launchd_restart_does_not_report_success_when_new_api_is_not_ready(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 5.0)
+        monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
+        monkeypatch.setattr(
+            gateway_cli, "_configured_api_server_endpoint", lambda: ("127.0.0.1", 8642)
+        )
+        monkeypatch.setattr(gateway_cli, "_launchctl_label_registered", lambda label: True)
+        monkeypatch.setattr(
+            gateway_cli, "_graceful_restart_via_sigusr1", lambda pid, timeout: True
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_launchd_gateway_ready",
+            lambda **kwargs: (
+                False,
+                654,
+                "configured API server 127.0.0.1:8642 is not accepting connections",
+            ),
+        )
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 321)
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda cmd, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+
+        with pytest.raises(
+            gateway_cli.GatewayRestartReadinessError,
+            match="Gateway replacement did not become ready",
+        ):
+            gateway_cli.launchd_restart()
+
+        assert "✓ Service restarted" not in capsys.readouterr().out
+
+    def test_launchd_readiness_ignores_stale_fatal_then_accepts_fresh_connected(
+        self, monkeypatch
+    ):
+        states = iter(
+            [
+                {
+                    "pid": 654,
+                    "gateway_state": "running",
+                    "platforms": {
+                        "api_server": {
+                            "state": "fatal",
+                            "error_code": "old",
+                            "updated_at": "before",
+                        }
+                    },
+                },
+                {
+                    "pid": 654,
+                    "gateway_state": "running",
+                    "platforms": {
+                        "api_server": {
+                            "state": "connected",
+                            "error_code": None,
+                            "updated_at": "after",
+                        }
+                    },
+                },
+            ]
+        )
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda **kwargs: 654)
+        monkeypatch.setattr(
+            gateway_cli, "_gateway_runtime_status_for_pid", lambda pid: next(states)
+        )
+        monkeypatch.setattr(gateway_cli, "_tcp_listener_is_accepting", lambda endpoint: True)
+        monkeypatch.setattr(gateway_cli.time, "sleep", lambda seconds: None)
+
+        assert gateway_cli._wait_for_launchd_gateway_ready(
+            previous_pid=321,
+            api_endpoint=("127.0.0.1", 8642),
+            previous_api_marker=("fatal", "old", "before"),
+            timeout=1.0,
+        ) == (True, 654, "")
+
+    def test_launchd_readiness_rejects_fresh_api_fatal(self, monkeypatch):
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda **kwargs: 654)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_gateway_runtime_status_for_pid",
+            lambda pid: {
+                "pid": pid,
+                "gateway_state": "running",
+                "platforms": {
+                    "api_server": {
+                        "state": "fatal",
+                        "error_code": "api_server_port_in_use",
+                        "error_message": "Port 8642 already in use",
+                        "updated_at": "after",
+                    }
+                },
+            },
+        )
+
+        assert gateway_cli._wait_for_launchd_gateway_ready(
+            previous_pid=321,
+            api_endpoint=("127.0.0.1", 8642),
+            previous_api_marker=("connected", None, "before"),
+            timeout=1.0,
+        ) == (False, 654, "Port 8642 already in use")
+
+    def test_gateway_command_turns_restart_readiness_failure_into_exit_one(
+        self, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(
+            gateway_cli,
+            "_gateway_command_inner",
+            lambda args: (_ for _ in ()).throw(
+                gateway_cli.GatewayRestartReadinessError("API did not recover")
+            ),
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            gateway_cli.gateway_command(SimpleNamespace())
+
+        assert exc.value.code == 1
+        assert "API did not recover" in capsys.readouterr().out
 
     def test_launchd_stop_tolerates_domain_unsupported_bootout(self, monkeypatch, capsys):
         """bootout exit 125 (macOS 26) must fall through to PID-based kill, not raise."""
@@ -1534,6 +1876,13 @@ class TestGatewayServiceDetection:
         assert gateway_cli._is_service_running() is False
 
 class TestGatewaySystemServiceRouting:
+    @pytest.fixture(autouse=True)
+    def _bypass_host_dbus_preflight(self, monkeypatch):
+        """These unit tests mock systemd itself; host D-Bus is out of scope."""
+        monkeypatch.setattr(
+            gateway_cli, "_preflight_user_systemd", lambda **kwargs: None
+        )
+
     def test_systemd_restart_gracefully_restarts_running_service_and_waits(self, monkeypatch, capsys):
         calls = []
 

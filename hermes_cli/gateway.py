@@ -93,6 +93,10 @@ class ProfileGatewayProcess:
     pid: int
 
 
+class GatewayRestartReadinessError(RuntimeError):
+    """The service manager relaunched a gateway that never became usable."""
+
+
 def _get_service_pids() -> set:
     """Return PIDs currently managed by systemd or launchd gateway services.
 
@@ -4337,78 +4341,321 @@ def _wait_for_gateway_exit(
     return True
 
 
+def _configured_api_server_endpoint() -> tuple[str, int] | None:
+    """Return the enabled API-server listener used by restart readiness checks.
+
+    Use the gateway's effective configuration rather than reimplementing its
+    precedence rules here.  In particular, ``load_gateway_config`` merges the
+    supported ``gateway.platforms.api_server`` and ``platforms.api_server``
+    shapes with service-scoped ``API_SERVER_*`` environment values.  Restart
+    readiness must observe the exact same endpoint as the adapter.
+    """
+    try:
+        from gateway.config import Platform, load_gateway_config
+
+        effective = load_gateway_config()
+        api_cfg = effective.platforms.get(Platform.API_SERVER)
+    except Exception as exc:
+        raise GatewayRestartReadinessError(
+            f"Unable to resolve effective API-server configuration: {exc}"
+        ) from exc
+
+    if api_cfg is not None:
+        if api_cfg.enabled is not True:
+            return None
+        api_extra = api_cfg.extra if isinstance(api_cfg.extra, dict) else {}
+        host = api_extra.get("host") or "127.0.0.1"
+        raw_port = api_extra.get("port", 8642)
+    else:
+        # ``load_gateway_config`` deliberately supports the modern platform
+        # blocks and service environment, but historical config.yaml files may
+        # still carry top-level API_SERVER_* keys that the CLI bootstrap
+        # bridges only on its normal entry path. Restart is also called through
+        # maintenance helpers, so retain this narrow legacy compatibility
+        # fallback after consulting the effective config first.
+        raw = read_raw_config()
+        if not isinstance(raw, dict):
+            raw = {}
+        legacy_enabled = _truthy_env(raw.get("API_SERVER_ENABLED"))
+        legacy_key = raw.get("API_SERVER_KEY")
+        if not legacy_enabled and not legacy_key:
+            return None
+        host = raw.get("API_SERVER_HOST") or "127.0.0.1"
+        raw_port = raw.get("API_SERVER_PORT", 8642)
+    try:
+        port = int(raw_port)
+    except (TypeError, ValueError):
+        port = 8642
+    if not 1 <= port <= 65535:
+        port = 8642
+
+    bind_host = str(host).strip() or "127.0.0.1"
+    if bind_host == "[::]":
+        bind_host = "::"
+    return bind_host, port
+
+
+def _connect_probe_endpoint(endpoint: tuple[str, int]) -> tuple[str, int]:
+    """Map wildcard bind addresses to a concrete local connect address."""
+    host, port = endpoint
+    if host == "0.0.0.0":
+        host = "127.0.0.1"
+    elif host == "::":
+        host = "::1"
+    return host, port
+
+
+def _tcp_listener_is_accepting(endpoint: tuple[str, int], timeout: float = 0.25) -> bool:
+    """Return whether a TCP listener currently accepts a local connection."""
+    import socket
+
+    try:
+        with socket.create_connection(
+            _connect_probe_endpoint(endpoint), timeout=max(timeout, 0.01)
+        ):
+            return True
+    except (OSError, TimeoutError):
+        return False
+
+
+def _wait_for_specific_pid_exit(pid: int, *, timeout: float) -> bool:
+    """Wait for the original process, independent of mutable PID-file state."""
+    from gateway.status import _pid_exists
+
+    deadline = time.monotonic() + max(timeout, 0.0)
+    while _pid_exists(pid):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+    return True
+
+
+def _runtime_platform_marker(
+    runtime_state: dict | None, platform: str
+) -> tuple[object, object, object] | None:
+    """Return the fields that change when a fresh adapter reports its state."""
+    platform_state = (((runtime_state or {}).get("platforms") or {}).get(platform) or {})
+    if not platform_state:
+        return None
+    return (
+        platform_state.get("state"),
+        platform_state.get("error_code"),
+        platform_state.get("updated_at"),
+    )
+
+
+def _wait_for_launchd_gateway_ready(
+    *,
+    previous_pid: int | None,
+    api_endpoint: tuple[str, int] | None,
+    previous_api_marker: tuple[object, object, object] | None = None,
+    timeout: float = 60.0,
+) -> tuple[bool, int | None, str]:
+    """Wait for a fresh gateway runtime and every configured critical listener."""
+    from gateway.status import get_running_pid
+
+    deadline = time.monotonic() + max(timeout, 0.0)
+    last_reason = "replacement gateway did not publish runtime readiness"
+    observed_pid: int | None = None
+
+    while time.monotonic() < deadline:
+        try:
+            observed_pid = get_running_pid(cleanup_stale=False)
+        except TypeError:
+            # Compatibility with older/mocked get_running_pid call shapes.
+            observed_pid = get_running_pid()
+        except Exception:
+            observed_pid = None
+
+        if observed_pid and (previous_pid is None or observed_pid != previous_pid):
+            runtime_state = _gateway_runtime_status_for_pid(observed_pid)
+            gateway_state = (runtime_state or {}).get("gateway_state")
+            if gateway_state == "startup_failed":
+                reason = (runtime_state or {}).get("exit_reason") or "startup failed"
+                return False, observed_pid, str(reason)
+
+            platform_state = (
+                ((runtime_state or {}).get("platforms") or {}).get("api_server") or {}
+            )
+            current_api_marker = _runtime_platform_marker(runtime_state, "api_server")
+            api_marker_is_fresh = (
+                current_api_marker is not None
+                and current_api_marker != previous_api_marker
+            )
+            if (
+                api_endpoint is not None
+                and api_marker_is_fresh
+                and platform_state.get("state") == "fatal"
+            ):
+                reason = platform_state.get("error_message") or "API server startup failed"
+                return False, observed_pid, str(reason)
+
+            if gateway_state in {"running", "degraded"}:
+                if api_endpoint is None:
+                    return True, observed_pid, ""
+                if (
+                    api_marker_is_fresh
+                    and platform_state.get("state") == "connected"
+                    and _tcp_listener_is_accepting(api_endpoint)
+                ):
+                    return True, observed_pid, ""
+                last_reason = (
+                    f"configured API server {api_endpoint[0]}:{api_endpoint[1]} "
+                    "has not reported fresh connected readiness"
+                )
+            else:
+                last_reason = (
+                    f"replacement PID {observed_pid} runtime state is "
+                    f"{gateway_state or 'not published'}"
+                )
+        time.sleep(0.2)
+
+    return False, observed_pid, last_reason
+
+
 def launchd_restart():
     label = get_launchd_label()
-    target = f"{_launchd_domain()}/{label}"
+    domain = _launchd_domain()
+    target = f"{domain}/{label}"
     drain_timeout = _get_restart_drain_timeout()
+    api_endpoint = _configured_api_server_endpoint()
+    previous_api_marker = _runtime_platform_marker(
+        _read_gateway_runtime_status(), "api_server"
+    )
     from gateway.status import get_running_pid
 
     try:
-        pid = get_running_pid()
+        try:
+            pid = get_running_pid(cleanup_stale=False)
+        except TypeError:
+            pid = get_running_pid()
         if pid is not None and _request_gateway_self_restart(pid):
             print("✓ Service restart requested")
             _clear_launchd_unsupported_marker()
             return
+
+        registered = _launchctl_label_registered(label)
         if pid is not None:
-            # Announce the drain BEFORE waiting on it. This wait can run for
-            # the full drain budget (180s by default) while the old gateway
-            # finishes in-flight agent runs, and it streams into surfaces with
-            # no other feedback — the desktop updater's live output most of
-            # all, where a silent stop here reads as "update stuck" (#44515).
-            # Mirrors the systemd branch's "draining (up to Ns)..." line.
             print(
-                f"→ Stopping gateway (PID {pid}) — draining in-flight runs "
+                f"⏳ Restarting gateway gracefully (PID {pid}) — draining in-flight runs "
                 f"(up to {drain_timeout:.0f}s)..."
             )
-            try:
-                terminate_pid(pid, force=False)
-            except (ProcessLookupError, PermissionError, OSError):
-                pid = None
-            if pid is not None:
-                exited = _wait_for_gateway_exit(timeout=drain_timeout, force_after=None)
-                if not exited:
-                    print(
-                        f"⚠ Gateway drain timed out after {drain_timeout:.0f}s — forcing launchd restart"
+            graceful = _graceful_restart_via_sigusr1(pid, drain_timeout + 5.0)
+            if not graceful:
+                print(
+                    f"⚠ Graceful restart did not finish within "
+                    f"{drain_timeout + 5.0:.0f}s; stopping only original PID {pid}"
+                )
+                from gateway.status import _pid_exists
+
+                # The old gateway may have exited between the helper's final
+                # liveness sample and this fallback. Never use ``kickstart -k``
+                # here: launchd KeepAlive may already be starting replacement A,
+                # and -k would kill A and create the original double-restart race.
+                if _pid_exists(pid):
+                    try:
+                        terminate_pid(pid, force=True)
+                    except (ProcessLookupError, PermissionError, OSError):
+                        pass
+                if not _wait_for_specific_pid_exit(pid, timeout=10.0):
+                    raise GatewayRestartReadinessError(
+                        f"Gateway PID {pid} is still alive; replacement "
+                        "was not started."
                     )
-        subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
-        print("✓ Service restarted")
-        _clear_launchd_unsupported_marker()
-    except subprocess.CalledProcessError as e:
-        if not _launchd_error_indicates_unloaded(e):
-            # Not a "job unloaded" code. If the domain is fundamentally
-            # unmanageable (error 5), degrade to detached; the old process was
-            # already drained/terminated above. Otherwise re-raise.
-            if _launchctl_domain_unsupported(e.returncode):
-                _launchd_fallback_to_detached(f"launchctl kickstart exit {e.returncode}")
-                return
-            raise
-        # Job not loaded — bootstrap and start fresh
-        print("↻ launchd job was unloaded; reloading")
-        plist_path = get_launchd_plist_path()
-        try:
-            # Restart is the one path where the job is almost always still
-            # registered (we just drained it), so a plain bootstrap would hit
-            # EIO on the common case. Boot the stale label out first — cheaper
-            # and clearer here than routing through _launchctl_bootstrap's
-            # bootstrap-first/retry-on-EIO flow. See #23387, #42914.
+                if not registered:
+                    # A detached gateway has no KeepAlive owner. Bootstrap the
+                    # installed service only after the captured PID is gone.
+                    _launchctl_bootstrap(
+                        domain, get_launchd_plist_path(), label, timeout=30
+                    )
+            elif not registered:
+                # The PID was a detached/manual gateway. SIGUSR1 drained it,
+                # but no KeepAlive owner exists to relaunch it.
+                _launchctl_bootstrap(
+                    domain, get_launchd_plist_path(), label, timeout=30
+                )
+        elif registered:
             subprocess.run(
-                ["launchctl", "bootout", target],
-                check=False,
+                ["launchctl", "kickstart", target],
+                check=True,
                 timeout=90,
             )
-            subprocess.run(
-                ["launchctl", "bootstrap", _launchd_domain(), str(plist_path)],
-                check=True,
-                timeout=30,
+        else:
+            _launchctl_bootstrap(
+                domain, get_launchd_plist_path(), label, timeout=30
             )
-            subprocess.run(["launchctl", "kickstart", target], check=True, timeout=30)
-        except subprocess.CalledProcessError as e2:
-            if not _launchctl_domain_unsupported(e2.returncode):
-                raise
-            _launchd_fallback_to_detached(f"launchctl exit {e2.returncode}")
-            return
-        print("✓ Service restarted")
+
+        ready, new_pid, reason = _wait_for_launchd_gateway_ready(
+            previous_pid=pid,
+            api_endpoint=api_endpoint,
+            previous_api_marker=previous_api_marker,
+        )
+        if not ready and new_pid is None and registered:
+            # The old PID is gone and launchd has not produced any replacement.
+            # A non-killing kickstart is safe here; it cannot terminate a
+            # concurrently spawned replacement.
+            subprocess.run(
+                ["launchctl", "kickstart", target],
+                check=True,
+                timeout=90,
+            )
+            ready, new_pid, reason = _wait_for_launchd_gateway_ready(
+                previous_pid=pid,
+                api_endpoint=api_endpoint,
+                previous_api_marker=previous_api_marker,
+            )
+        if not ready:
+            raise GatewayRestartReadinessError(
+                f"Gateway replacement did not become ready"
+                f"{f' (PID {new_pid})' if new_pid else ''}: {reason}."
+            )
+
+        suffix = f" (PID {new_pid})" if new_pid else ""
+        if api_endpoint is not None:
+            suffix += f"; API {api_endpoint[0]}:{api_endpoint[1]} ready"
+        print(f"✓ Service restarted{suffix}")
         _clear_launchd_unsupported_marker()
+    except subprocess.CalledProcessError as e:
+        if _launchd_error_indicates_unloaded(e):
+            try:
+                _launchctl_bootstrap(
+                    domain, get_launchd_plist_path(), label, timeout=30
+                )
+            except subprocess.CalledProcessError as bootstrap_error:
+                e = bootstrap_error
+            else:
+                ready, new_pid, reason = _wait_for_launchd_gateway_ready(
+                    previous_pid=pid,
+                    api_endpoint=api_endpoint,
+                    previous_api_marker=previous_api_marker,
+                )
+                if not ready:
+                    raise GatewayRestartReadinessError(
+                        f"Gateway replacement did not become ready: {reason}."
+                    )
+                print(f"✓ Service restarted (PID {new_pid})")
+                _clear_launchd_unsupported_marker()
+                return
+
+        if _launchctl_domain_unsupported(e.returncode):
+            if pid is not None:
+                try:
+                    terminate_pid(pid, force=True)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+            _launchd_fallback_to_detached(f"launchctl exit {e.returncode}")
+            ready, new_pid, reason = _wait_for_launchd_gateway_ready(
+                previous_pid=pid,
+                api_endpoint=api_endpoint,
+                previous_api_marker=previous_api_marker,
+            )
+            if ready:
+                print(f"✓ Service restarted in detached mode (PID {new_pid})")
+                return
+            raise GatewayRestartReadinessError(
+                f"Detached gateway replacement did not become ready: {reason}."
+            ) from e
+        raise
 
 
 def launchd_status(deep: bool = False):
@@ -6417,6 +6664,9 @@ def gateway_command(args):
     """Handle gateway subcommands."""
     try:
         return _gateway_command_inner(args)
+    except GatewayRestartReadinessError as e:
+        print_error(str(e))
+        sys.exit(1)
     except UserSystemdUnavailableError as e:
         # Clean, actionable message instead of a traceback when the user D-Bus
         # session is unreachable (fresh SSH shell, no linger, container, etc.).
