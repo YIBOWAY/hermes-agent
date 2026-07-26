@@ -111,6 +111,9 @@ _PLATFORM_RUN_ID: ContextVar = ContextVar(
 _PLATFORM_MANAGED_SESSION_ID: ContextVar = ContextVar(
     "HERMES_PLATFORM_MANAGED_SESSION_ID", default=_UNSET
 )
+_PLATFORM_RESOLVED_SESSION_ID: ContextVar = ContextVar(
+    "HERMES_PLATFORM_RESOLVED_SESSION_ID", default=_UNSET
+)
 
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
@@ -156,6 +159,7 @@ _VAR_MAP = {
     "HERMES_PLATFORM_SESSION_ID": _PLATFORM_SESSION_ID,
     "HERMES_PLATFORM_RUN_ID": _PLATFORM_RUN_ID,
     "HERMES_PLATFORM_MANAGED_SESSION_ID": _PLATFORM_MANAGED_SESSION_ID,
+    "HERMES_PLATFORM_RESOLVED_SESSION_ID": _PLATFORM_RESOLVED_SESSION_ID,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
@@ -196,6 +200,7 @@ def set_session_vars(
     platform_session_id: str = "",
     platform_run_id: str = "",
     platform_managed_session_id: str = "",
+    platform_resolved_session_id: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -234,6 +239,7 @@ def set_session_vars(
         _PLATFORM_SESSION_ID.set(platform_session_id),
         _PLATFORM_RUN_ID.set(platform_run_id),
         _PLATFORM_MANAGED_SESSION_ID.set(platform_managed_session_id),
+        _PLATFORM_RESOLVED_SESSION_ID.set(platform_resolved_session_id),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
     ]
     try:
@@ -273,6 +279,7 @@ def clear_session_vars(tokens: list) -> None:
         _PLATFORM_SESSION_ID,
         _PLATFORM_RUN_ID,
         _PLATFORM_MANAGED_SESSION_ID,
+        _PLATFORM_RESOLVED_SESSION_ID,
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a

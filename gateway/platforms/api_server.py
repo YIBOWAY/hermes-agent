@@ -4987,6 +4987,7 @@ class APIServerAdapter(BasePlatformAdapter):
         platform_session_id: str = "",
         platform_run_id: str = "",
         platform_managed_session_id: str = "",
+        platform_resolved_session_id: str = "",
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -5015,6 +5016,7 @@ class APIServerAdapter(BasePlatformAdapter):
             platform_session_id=platform_session_id,
             platform_run_id=platform_run_id,
             platform_managed_session_id=platform_managed_session_id,
+            platform_resolved_session_id=platform_resolved_session_id,
         )
 
     async def _run_agent(
@@ -5558,7 +5560,12 @@ class APIServerAdapter(BasePlatformAdapter):
     def _resolve_managed_run_session(
         self,
         requested_session_id: Any,
-    ) -> tuple[Optional[str], List[Dict[str, Any]], Optional["web.Response"]]:
+    ) -> tuple[
+        Optional[str],
+        Optional[str],
+        List[Dict[str, Any]],
+        Optional["web.Response"],
+    ]:
         """Resolve one caller-supplied managed Session to its durable live tip.
 
         Hermes, not the platform client, owns transcript recovery.  A supplied
@@ -5575,7 +5582,7 @@ class APIServerAdapter(BasePlatformAdapter):
             or re.search(r"[\r\n\x00]", requested_session_id)
             or _is_path_unsafe(requested_session_id)
         ):
-            return None, [], web.json_response(
+            return None, None, [], web.json_response(
                 _openai_error(
                     "Invalid managed session ID",
                     code="invalid_session_id",
@@ -5585,7 +5592,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         db = self._ensure_session_db()
         if db is None:
-            return None, [], web.json_response(
+            return None, None, [], web.json_response(
                 _openai_error(
                     "Session database unavailable",
                     code="session_db_unavailable",
@@ -5599,7 +5606,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "[api_server] managed session lookup failed for %s",
                 requested_session_id,
             )
-            return None, [], web.json_response(
+            return None, None, [], web.json_response(
                 _openai_error(
                     "Session database unavailable",
                     code="session_db_unavailable",
@@ -5607,7 +5614,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=503,
             )
         if source is None:
-            return None, [], web.json_response(
+            return None, None, [], web.json_response(
                 _openai_error(
                     f"Session not found: {requested_session_id}",
                     code="session_not_found",
@@ -5623,7 +5630,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if resolved is None:
                 raise LookupError("resolved session is missing")
             if resolved.get("ended_at") is not None:
-                return None, [], web.json_response(
+                return None, None, [], web.json_response(
                     _openai_error(
                         "Session is ended; fork it before continuing",
                         code="session_ended",
@@ -5636,8 +5643,13 @@ class APIServerAdapter(BasePlatformAdapter):
             # ancestors whose separate message segments belong to this live
             # conversation, and SessionDB already owns that distinction.
             lineage = db.get_compression_lineage(resolved_session_id)
-            if not lineage:
+            if (
+                not lineage
+                or requested_session_id not in lineage
+                or resolved_session_id not in lineage
+            ):
                 raise LookupError("resolved session lineage is unavailable")
+            conversation_session_id = str(lineage[0])
             history = []
             for lineage_session_id in lineage:
                 history.extend(
@@ -5659,25 +5671,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 "[api_server] managed session history recovery failed for %s",
                 requested_session_id,
             )
-            return None, [], web.json_response(
+            return None, None, [], web.json_response(
                 _openai_error(
                     "Session history is unavailable",
                     code="session_history_unavailable",
                 ),
                 status=503,
             )
-        return resolved_session_id, history, None
-
-    @staticmethod
-    def _managed_idempotency_store_key(
-        managed_session_scope: str,
-        client_key: str,
-    ) -> str:
-        """Scope a client action key to one managed Session without leaking ids."""
-        scope = hashlib.sha256(
-            managed_session_scope.encode("utf-8")
-        ).hexdigest()
-        return f"managed:{scope}:{client_key}"
+        return conversation_session_id, resolved_session_id, history, None
 
     @staticmethod
     def _managed_session_scope(session_id: str) -> str:
@@ -5701,6 +5702,7 @@ class APIServerAdapter(BasePlatformAdapter):
         *,
         run_id: str,
         fallback_session_id: str,
+        fallback_conversation_session_id: Optional[str],
         idempotency_key: str,
         gateway_session_key: Optional[str],
     ) -> "web.Response":
@@ -5718,12 +5720,19 @@ class APIServerAdapter(BasePlatformAdapter):
         replay_session_id = str(
             stored_run.get("session_id") or fallback_session_id or run_id
         )
+        conversation_session_id = str(
+            stored_run.get("conversation_session_id")
+            or fallback_conversation_session_id
+            or replay_session_id
+        )
         try:
             replay_body = self._public_run_status(
                 {
                     "run_id": run_id,
                     "status": stored_run.get("status"),
                     "session_id": replay_session_id,
+                    "conversation_session_id": conversation_session_id,
+                    "resolved_session_id": replay_session_id,
                     "created": False,
                     "idempotent_replay": True,
                     "idempotency_key": idempotency_key,
@@ -5772,6 +5781,9 @@ class APIServerAdapter(BasePlatformAdapter):
             return self._durable_submission_replay_response(
                 run_id=claim["run_id"],
                 fallback_session_id=session_id,
+                fallback_conversation_session_id=managed_session_scope.split(
+                    "\x1f", 1
+                )[-1],
                 idempotency_key=idempotency_key,
                 gateway_session_key=gateway_session_key,
             )
@@ -5823,6 +5835,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # reject that shape rather than choosing ambiguous precedence.
         conversation_history: List[Dict[str, Any]] = []
         stored_session_id = None
+        conversation_session_id = None
         if requested_managed_session_id is not None:
             if (
                 "conversation_history" in body
@@ -5837,6 +5850,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=400,
                 )
             (
+                conversation_session_id,
                 resolved_session_id,
                 conversation_history,
                 session_error,
@@ -5950,29 +5964,33 @@ class APIServerAdapter(BasePlatformAdapter):
         if platform_context_error is not None:
             return platform_context_error
         managed_session_scope = (
-            self._managed_session_scope(str(resolved_session_id))
+            self._managed_session_scope(str(conversation_session_id))
             if managed_session
             else None
         )
+        idempotency_request_body = dict(body)
+        if managed_session:
+            # Idempotency is a property of the stable compression lineage, not
+            # whichever root/tip alias the caller happened to retain.
+            idempotency_request_body["session_id"] = str(
+                conversation_session_id
+            )
         if managed_session:
             busy_response = self._managed_session_busy_response(
                 managed_session_scope=str(managed_session_scope),
                 session_id=str(resolved_session_id),
                 idempotency_key=idempotency_key,
-                request_body=body,
+                request_body=idempotency_request_body,
                 gateway_session_key=gateway_session_key,
             )
             if busy_response is not None:
                 return busy_response
 
+        # Caller keys are globally single-use.  The canonical request digest
+        # carries the stable compression root, so root/tip aliases recover one
+        # Run while an unrelated lineage with the same action identity
+        # conflicts instead of starting a second provider execution.
         idempotency_store_key = idempotency_key
-        if managed_session and idempotency_key is not None:
-            idempotency_store_key = self._managed_idempotency_store_key(
-                self._managed_session_scope(
-                    str(requested_managed_session_id)
-                ),
-                idempotency_key,
-            )
 
         # Read-only exact recovery precedes provider concurrency admission.  A
         # completed Run replay remains available while another Session occupies
@@ -5983,7 +6001,7 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 existing_submit = self._durable_store.find_submission(
                     idempotency_key=str(idempotency_store_key),
-                    request_body=body,
+                    request_body=idempotency_request_body,
                 )
             except ConflictError:
                 return web.json_response(
@@ -6004,6 +6022,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     fallback_session_id=str(
                         resolved_session_id or existing_submit.run_id
                     ),
+                    fallback_conversation_session_id=(
+                        str(conversation_session_id)
+                        if conversation_session_id is not None
+                        else None
+                    ),
                     idempotency_key=idempotency_key,
                     gateway_session_key=gateway_session_key,
                 )
@@ -6020,8 +6043,9 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 submit = self._durable_store.submit_or_get(
                     idempotency_key=str(idempotency_store_key),
-                    request_body=body,
+                    request_body=idempotency_request_body,
                     session_id=resolved_session_id,
+                    conversation_session_id=conversation_session_id,
                 )
             except ConflictError:
                 return web.json_response(
@@ -6048,6 +6072,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     fallback_session_id=str(
                         resolved_session_id or submit.run_id
                     ),
+                    fallback_conversation_session_id=(
+                        str(conversation_session_id)
+                        if conversation_session_id is not None
+                        else None
+                    ),
                     idempotency_key=idempotency_key,
                     gateway_session_key=gateway_session_key,
                 )
@@ -6070,6 +6099,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     self._durable_store.register_run(
                         run_id=run_id,
                         session_id=session_id,
+                        conversation_session_id=conversation_session_id,
                         request_body=body,
                     )
             except Exception:
@@ -6124,7 +6154,9 @@ class APIServerAdapter(BasePlatformAdapter):
             self._managed_session_runs[str(managed_session_scope)] = {
                 "run_id": run_id,
                 "idempotency_key": idempotency_key or "",
-                "request_digest": self._request_digest_for_busy_check(body),
+                "request_digest": self._request_digest_for_busy_check(
+                    idempotency_request_body
+                ),
             }
 
         # Approval queues gate host-side tool execution and must be isolated
@@ -6182,6 +6214,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "queued",
                 created_at=created_at,
                 session_id=session_id,
+                conversation_session_id=(
+                    conversation_session_id or session_id
+                ),
+                resolved_session_id=session_id,
                 model=body.get("model", self._model_name),
             )
         except Exception:
@@ -6414,6 +6450,11 @@ class APIServerAdapter(BasePlatformAdapter):
                                     run_id if platform_run_context else ""
                                 ),
                                 platform_managed_session_id=(
+                                    str(conversation_session_id)
+                                    if platform_run_context
+                                    else ""
+                                ),
+                                platform_resolved_session_id=(
                                     str(session_id)
                                     if platform_run_context
                                     else ""
@@ -6600,6 +6641,10 @@ class APIServerAdapter(BasePlatformAdapter):
             {
                 "run_id": run_id,
                 "session_id": session_id,
+                "conversation_session_id": (
+                    conversation_session_id or session_id
+                ),
+                "resolved_session_id": session_id,
                 "created": submission_created,
                 "status": "queued",
             },
@@ -6719,6 +6764,10 @@ class APIServerAdapter(BasePlatformAdapter):
             "run_id": row["run_id"],
             "status": row.get("status"),
             "session_id": row.get("session_id"),
+            "conversation_session_id": (
+                row.get("conversation_session_id") or row.get("session_id")
+            ),
+            "resolved_session_id": row.get("session_id"),
             "created_at": row.get("created_at"),
             "updated_at": row.get("updated_at"),
         }

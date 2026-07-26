@@ -188,6 +188,9 @@ async def test_platform_run_context_reaches_only_current_managed_run_environment
                 "managed_session_id": get_session_env(
                     "HERMES_PLATFORM_MANAGED_SESSION_ID"
                 ),
+                "resolved_session_id": get_session_env(
+                    "HERMES_PLATFORM_RESOLVED_SESSION_ID"
+                ),
                 "child_env": child_env,
             }
         )
@@ -219,6 +222,7 @@ async def test_platform_run_context_reaches_only_current_managed_run_environment
     assert captured["platform_session_id"] == "platform-session-5"
     assert captured["platform_run_id"] == body["run_id"]
     assert captured["managed_session_id"] == "web_managed_1"
+    assert captured["resolved_session_id"] == "web_managed_1"
     assert captured["child_env"] == {
         "HERMES_SESSION_PLATFORM": "api_server",
         "HERMES_SESSION_SOURCE": "",
@@ -236,6 +240,7 @@ async def test_platform_run_context_reaches_only_current_managed_run_environment
         "HERMES_PLATFORM_SESSION_ID": "platform-session-5",
         "HERMES_PLATFORM_RUN_ID": body["run_id"],
         "HERMES_PLATFORM_MANAGED_SESSION_ID": "web_managed_1",
+        "HERMES_PLATFORM_RESOLVED_SESSION_ID": "web_managed_1",
     }
     assert create_agent.call_args.kwargs["ephemeral_system_prompt"] is None
 
@@ -432,6 +437,156 @@ async def test_managed_session_resolves_compression_tip_and_ancestor_history(
         {"role": "user", "content": "before compression"},
         {"role": "assistant", "content": "after compression"},
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first_alias", "retry_alias"),
+    [
+        ("managed-root", "managed-root"),
+        ("managed-root", "managed-tip"),
+        ("managed-tip", "managed-root"),
+    ],
+)
+async def test_compression_alias_retries_share_one_durable_run(
+    managed_state,
+    first_alias,
+    retry_alias,
+):
+    session_db, durable_store = managed_state
+    session_db.create_session("managed-root", "api_server")
+    session_db.end_session("managed-root", "compression")
+    session_db.create_session(
+        "managed-tip",
+        "api_server",
+        parent_session_id="managed-root",
+    )
+    adapter = _make_adapter(
+        session_db=session_db,
+        durable_store=durable_store,
+    )
+    captured: dict[str, str] = {}
+    agent = MagicMock()
+
+    def _run_conversation(**_kwargs):
+        from gateway.session_context import get_session_env
+
+        captured["conversation_root"] = get_session_env(
+            "HERMES_PLATFORM_MANAGED_SESSION_ID"
+        )
+        captured["resolved_tip"] = get_session_env(
+            "HERMES_PLATFORM_RESOLVED_SESSION_ID"
+        )
+        captured["canonical_session"] = get_session_env("HERMES_SESSION_ID")
+        return {"final_response": "done"}
+
+    agent.run_conversation.side_effect = _run_conversation
+    agent.session_prompt_tokens = 0
+    agent.session_completion_tokens = 0
+    agent.session_total_tokens = 0
+
+    with patch.object(
+        adapter,
+        "_create_agent",
+        return_value=agent,
+    ) as create_agent:
+        async with TestClient(TestServer(_runs_app(adapter))) as client:
+            headers = {"Idempotency-Key": "same-compressed-turn"}
+            first = await client.post(
+                "/v1/runs",
+                json={
+                    "input": "continue",
+                    "session_id": first_alias,
+                    "metadata": _platform_metadata(),
+                },
+                headers=headers,
+            )
+            first_body = await first.json()
+            await _wait_for_run(adapter, first_body["run_id"])
+            retry = await client.post(
+                "/v1/runs",
+                json={
+                    "input": "continue",
+                    "session_id": retry_alias,
+                    "metadata": _platform_metadata(),
+                },
+                headers=headers,
+            )
+            retry_body = await retry.json()
+
+    assert first.status == retry.status == 202
+    assert retry_body["run_id"] == first_body["run_id"]
+    assert retry_body["created"] is False
+    for receipt in (first_body, retry_body):
+        assert receipt["conversation_session_id"] == "managed-root"
+        assert receipt["resolved_session_id"] == "managed-tip"
+        assert receipt["session_id"] == "managed-tip"
+    assert captured == {
+        "conversation_root": "managed-root",
+        "resolved_tip": "managed-tip",
+        "canonical_session": "managed-tip",
+    }
+    assert create_agent.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_compression_during_run_retry_recovers_original_bound_tip(
+    managed_state,
+):
+    session_db, durable_store = managed_state
+    session_db.create_session("managed-root", "api_server")
+    adapter = _make_adapter(
+        session_db=session_db,
+        durable_store=durable_store,
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    agent = MagicMock()
+
+    def _block(**_kwargs):
+        entered.set()
+        release.wait(timeout=2)
+        return {"final_response": "done"}
+
+    agent.run_conversation.side_effect = _block
+    agent.session_prompt_tokens = 0
+    agent.session_completion_tokens = 0
+    agent.session_total_tokens = 0
+
+    with patch.object(adapter, "_create_agent", return_value=agent) as create_agent:
+        async with TestClient(TestServer(_runs_app(adapter))) as client:
+            headers = {"Idempotency-Key": "compression-during-run"}
+            first = await client.post(
+                "/v1/runs",
+                json={"input": "continue", "session_id": "managed-root"},
+                headers=headers,
+            )
+            first_body = await first.json()
+            assert await asyncio.to_thread(entered.wait, 1)
+
+            session_db.end_session("managed-root", "compression")
+            session_db.create_session(
+                "managed-new-tip",
+                "api_server",
+                parent_session_id="managed-root",
+            )
+            retry = await client.post(
+                "/v1/runs",
+                json={"input": "continue", "session_id": "managed-new-tip"},
+                headers=headers,
+            )
+            retry_body = await retry.json()
+            release.set()
+            await _wait_for_run(adapter, first_body["run_id"])
+
+    assert first.status == retry.status == 202
+    assert retry_body["run_id"] == first_body["run_id"]
+    assert retry_body["created"] is False
+    assert retry_body["conversation_session_id"] == "managed-root"
+    # A Run never drifts to a later compression tip after admission.
+    assert retry_body["resolved_session_id"] == "managed-root"
+    assert retry_body["session_id"] == "managed-root"
+    assert create_agent.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -759,7 +914,7 @@ async def test_completed_ack_replay_bypasses_other_session_concurrency(
 
 
 @pytest.mark.asyncio
-async def test_same_client_id_is_scoped_by_managed_session(managed_state):
+async def test_same_client_id_rejects_unrelated_managed_session_alias(managed_state):
     session_db, durable_store = managed_state
     session_db.create_session("managed-a", "api_server")
     session_db.create_session("managed-b", "api_server")
@@ -785,13 +940,12 @@ async def test_same_client_id_is_scoped_by_managed_session(managed_state):
             first_body = await first.json()
             second_body = await second.json()
             await _wait_for_run(adapter, first_body["run_id"])
-            await _wait_for_run(adapter, second_body["run_id"])
 
-    assert first.status == second.status == 202
-    assert first_body["run_id"] != second_body["run_id"]
+    assert first.status == 202
+    assert second.status == 409
+    assert second_body["error"]["code"] == "idempotency_conflict"
     assert first_body["session_id"] == "managed-a"
-    assert second_body["session_id"] == "managed-b"
-    assert create_agent.call_count == 2
+    assert create_agent.call_count == 1
 
 
 @pytest.mark.asyncio
