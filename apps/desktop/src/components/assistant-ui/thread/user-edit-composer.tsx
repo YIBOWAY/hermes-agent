@@ -158,6 +158,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
     [aui, rememberInitialDraft]
   )
 
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     draftRef.current = draft
 
@@ -180,7 +181,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
   }, [focusEditor, focusRequestId])
 
   useEffect(() => {
-    const offFocus = onComposerFocusRequest(target => {
+    const offFocus = onComposerFocusRequest(({ target }) => {
       if (target === 'edit') {
         setFocusRequestId(id => id + 1)
       }

@@ -1518,7 +1518,14 @@ class TestToolsetInjection:
             broken_fixed = True
             call_count = 0
 
-            # Second call: should retry broken, skip good
+            # The failed server is now serving a post-failure backoff
+            # (#50394: prevents a tight re-spawn storm across the frequent
+            # per-worker-session discovery passes). Expire that cooldown to
+            # simulate the retry window having elapsed.
+            import tools.mcp_tool as _mcp_mod
+            _mcp_mod._server_connect_retry_after.pop("broken", None)
+
+            # Next call after the cooldown: should retry broken, skip good
             result2 = discover_mcp_tools()
             assert "mcp__good__ping" in result2
             assert "mcp__broken__ping" in result2
@@ -1755,6 +1762,41 @@ class TestBuildSafeEnv:
         assert "OPENAI_API_KEY" not in result
         assert "DATABASE_URL" not in result
         assert "API_SECRET" not in result
+
+    def test_secret_source_injected_vars_are_passed(self, monkeypatch):
+        """Vars tagged by an external secret source (Bitwarden/1Password) are
+        deliberately allowed for MCP stdio servers."""
+        from hermes_cli import env_loader
+        from tools.mcp_tool import _build_safe_env
+
+        monkeypatch.setitem(env_loader._SECRET_SOURCES, "ALPACA_API_KEY", "bitwarden")
+        monkeypatch.setitem(env_loader._SECRET_SOURCES, "NOTION_TOKEN", "onepassword")
+        fake_env = {
+            "PATH": "/usr/bin",
+            "ALPACA_API_KEY": "from-bws-key",
+            "NOTION_TOKEN": "from-op",
+            "UNTRACKED_SECRET_KEY": "still-filtered",
+        }
+        with patch.dict("os.environ", fake_env, clear=True):
+            result = _build_safe_env(None)
+
+        assert result["PATH"] == "/usr/bin"
+        assert result["ALPACA_API_KEY"] == "from-bws-key"
+        assert result["NOTION_TOKEN"] == "from-op"
+        assert "UNTRACKED_SECRET_KEY" not in result
+
+    def test_user_env_overrides_secret_source_var(self, monkeypatch):
+        """Explicit MCP server env config remains the highest-precedence source."""
+        from hermes_cli import env_loader
+        from tools.mcp_tool import _build_safe_env
+
+        monkeypatch.setitem(env_loader._SECRET_SOURCES, "ALPACA_API_KEY", "bitwarden")
+        with patch.dict(
+            "os.environ", {"PATH": "/usr/bin", "ALPACA_API_KEY": "from-bws"}, clear=True
+        ):
+            result = _build_safe_env({"ALPACA_API_KEY": "from-config"})
+
+        assert result["ALPACA_API_KEY"] == "from-config"
 
     def test_windows_location_vars_passed_without_secrets(self):
         """Windows launcher tools need location vars, but secrets stay filtered."""
@@ -3831,6 +3873,52 @@ class TestMCPSelectiveToolLoading:
             "mcp__ink_exclude__create_service",
             "mcp__ink_exclude__list_services",
         ]
+
+    def test_exclude_filter_supports_globs(self):
+        """fnmatch globs in exclude — the Cloudflare flat-mode shape
+        (``*_radar_*`` etc.). Previously silently matched nothing."""
+        config = {
+            "url": "https://mcp.example.com",
+            "tools": {"exclude": ["*_radar_*", "delete_*"]},
+        }
+        registered, _ = self._run_discover(
+            "ink_glob",
+            ["get_radar_summary", "get_accounts_radar_http", "delete_service",
+             "create_service", "list_services"],
+            config,
+            session=SimpleNamespace(),
+        )
+        assert registered == [
+            "mcp__ink_glob__create_service",
+            "mcp__ink_glob__list_services",
+        ]
+
+    def test_include_filter_supports_globs(self):
+        """Globs work symmetrically on the include whitelist."""
+        config = {
+            "url": "https://mcp.example.com",
+            "tools": {"include": ["get_zones_*"]},
+        }
+        registered, _ = self._run_discover(
+            "ink_glob_inc",
+            ["get_zones_dns_records", "get_zones_settings", "delete_zone",
+             "get_accounts"],
+            config,
+            session=SimpleNamespace(),
+        )
+        assert registered == [
+            "mcp__ink_glob_inc__get_zones_dns_records",
+            "mcp__ink_glob_inc__get_zones_settings",
+        ]
+
+    def test_exact_names_still_match_exactly(self):
+        """No-metachar entries stay literal — 'docs' must not glob-match
+        'docs_search', and exact matching is unchanged."""
+        from tools.mcp_tool import matches_name_filter
+        assert matches_name_filter("docs", {"docs"})
+        assert not matches_name_filter("docs_search", {"docs"})
+        assert matches_name_filter("docs_search", {"docs*"})
+        assert not matches_name_filter("anything", set())
 
     def test_include_filter_skips_utility_tools_without_capabilities(self):
         config = {

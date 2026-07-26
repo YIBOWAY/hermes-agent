@@ -996,6 +996,7 @@ class MatrixAdapter(BasePlatformAdapter):
         # Matrix reaction-based dangerous command approvals.
         self._approval_reaction_map = {
             "✅": "once",
+            "🌀": "session",
             "♾️": "always",
             "♾": "always",
             "\u267e\ufe0f": "always",
@@ -1936,13 +1937,13 @@ class MatrixAdapter(BasePlatformAdapter):
                         return b"".join(parts), ct, fname
                 raise ValueError("too many redirects")
         except ImportError:
-            import httpx
+            from tools.url_safety import create_ssrf_safe_async_client
 
             _httpx_kw: dict = {}
             if self._proxy_url:
                 _httpx_kw["proxy"] = self._proxy_url
             _httpx_kw["event_hooks"] = {"response": [_ssrf_redirect_guard]}
-            async with httpx.AsyncClient(**_httpx_kw) as http:
+            async with create_ssrf_safe_async_client(**_httpx_kw) as http:
                 async with http.stream(
                     "GET",
                     url,
@@ -2063,6 +2064,7 @@ class MatrixAdapter(BasePlatformAdapter):
         description: str = "dangerous command",
         metadata: Optional[dict] = None,
         allow_permanent: bool = True,
+        allow_session: bool = True,
         smart_denied: bool = False,
     ) -> SendResult:
         """Send a reaction-based exec approval prompt for Matrix."""
@@ -2075,17 +2077,24 @@ class MatrixAdapter(BasePlatformAdapter):
         if smart_denied:
             scope_choices = "Smart DENY: owner override applies to this one operation only.\n"
         else:
-            scope_choices = "Reply `!approve session` to approve this pattern for the session, "
+            scope_choices = ""
+            if allow_session:
+                scope_choices += "Reply `!approve session` to approve this pattern for the session, "
             if allow_permanent:
                 scope_choices += "`!approve always` to approve permanently, "
+        reaction_legend_parts = ["✅ = approve once"]
+        if allow_session:
+            reaction_legend_parts.append("🌀 = approve for this session")
+            if allow_permanent:
+                reaction_legend_parts.append("♾️ = approve always")
+        reaction_legend_parts.append("❎ = deny")
         text = (
             "⚠️ **Dangerous command requires approval**\n"
             f"```\n{cmd_preview}\n```\n"
             f"Reason: {description}\n\n"
             f"{scope_choices}Reply `!approve` to execute once, or `!deny` to cancel.\n\n"
             "You can also click the reaction to approve:\n"
-            "✅ = approve\n"
-            "❎ = deny"
+            + "\n".join(reaction_legend_parts)
         )
 
         result = await self.send(chat_id, text, metadata=metadata)
@@ -2105,7 +2114,12 @@ class MatrixAdapter(BasePlatformAdapter):
         self._approval_prompts_by_event[result.message_id] = prompt
         self._approval_prompt_by_session[session_key] = result.message_id
 
-        reactions = ("✅", "❌") if smart_denied or not allow_permanent else ("✅", "♾️", "❌")
+        if not allow_session:
+            reactions = ("✅", "❌")
+        elif not allow_permanent:
+            reactions = ("✅", "🌀", "❌")
+        else:
+            reactions = ("✅", "🌀", "♾️", "❌")
         for emoji in reactions:
             try:
                 reaction_result = await self._send_reaction(chat_id, result.message_id, emoji)
@@ -4596,7 +4610,7 @@ def interactive_setup() -> None:
     and the static _PLATFORMS["matrix"] dict. CLI helpers are lazy-imported."""
     import shutil
     import sys as _sys
-    from hermes_cli.config import get_env_value, save_env_value
+    from hermes_cli.config import get_env_value, remove_env_value, save_env_value
     from hermes_cli.cli_output import (
         prompt,
         prompt_yes_no,
@@ -4686,9 +4700,13 @@ def interactive_setup() -> None:
         print_info("📬 Home Room: where Hermes delivers cron job results and notifications.")
         print_info("   Room IDs look like !abc123:server (shown in Element room settings)")
         print_info("   You can also set this later by typing /set-home in a Matrix room.")
-        home_room = prompt("Home room ID (leave empty to set later with /set-home)")
+        print_info("Leave blank to clear a previously saved home room (cron / notifications).")
+        home_room = prompt("Home room ID (leave empty to set later with /set-home)").strip()
         if home_room:
             save_env_value("MATRIX_HOME_ROOM", home_room)
+        else:
+            if remove_env_value("MATRIX_HOME_ROOM"):
+                print_info("Home room cleared.")
 
 
 def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
