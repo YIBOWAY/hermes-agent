@@ -183,6 +183,7 @@ CREATE TABLE IF NOT EXISTS runs (
     request_digest   TEXT NOT NULL,
     status           TEXT NOT NULL,
     session_id       TEXT,
+    conversation_session_id TEXT,
     requested_policy TEXT,
     actual_policy    TEXT,
     fallback_reason  TEXT,
@@ -272,6 +273,16 @@ class DurableRunStore:
                 self._conn.execute(
                     "ALTER TABLE approval_grants ADD COLUMN approval_id TEXT"
                 )
+            run_columns = {
+                row["name"]
+                for row in self._conn.execute(
+                    "PRAGMA table_info(runs)"
+                ).fetchall()
+            }
+            if "conversation_session_id" not in run_columns:
+                self._conn.execute(
+                    "ALTER TABLE runs ADD COLUMN conversation_session_id TEXT"
+                )
 
     def close(self) -> None:
         try:
@@ -347,6 +358,7 @@ class DurableRunStore:
         idempotency_key: str,
         request_body: dict[str, Any],
         session_id: Optional[str] = None,
+        conversation_session_id: Optional[str] = None,
     ) -> SubmitResult:
         digest = canonical_digest(request_body)
 
@@ -367,14 +379,18 @@ class DurableRunStore:
             try:
                 conn.execute(
                     "INSERT INTO runs (run_id, idempotency_key, request_digest,"
-                    " status, session_id, created_at, updated_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    " status, session_id, conversation_session_id, created_at,"
+                    " updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         run_id,
                         idempotency_key,
                         digest,
                         RunState.QUEUED.value,
                         session_id or request_body.get("session_id") or run_id,
+                        conversation_session_id
+                        or session_id
+                        or request_body.get("session_id")
+                        or run_id,
                         now,
                         now,
                     ),
@@ -418,6 +434,7 @@ class DurableRunStore:
         *,
         run_id: str,
         session_id: Optional[str] = None,
+        conversation_session_id: Optional[str] = None,
         idempotency_key: Optional[str] = None,
         request_body: Optional[dict[str, Any]] = None,
         requested_policy: Optional[str] = None,
@@ -447,14 +464,15 @@ class DurableRunStore:
             )
             conn.execute(
                 "INSERT INTO runs (run_id, idempotency_key, request_digest, status,"
-                " session_id, requested_policy, created_at, updated_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                " session_id, conversation_session_id, requested_policy,"
+                " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run_id,
                     idempotency_key or f"server:{run_id}",
                     digest,
                     RunState.QUEUED.value,
                     session_id or run_id,
+                    conversation_session_id or session_id or run_id,
                     requested_policy,
                     now,
                     now,

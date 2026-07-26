@@ -133,6 +133,33 @@ def test_submit_or_get_persists_resolved_session_identity(store) -> None:
     assert store.get_run(result.run_id)["session_id"] == "session_from_previous_response"
 
 
+def test_conversation_root_and_resolved_tip_survive_reopen(store, tmp_path) -> None:
+    result = store.submit_or_get(
+        idempotency_key="k-compressed-session",
+        request_body={"input": "continue", "session_id": "conversation-root"},
+        session_id="resolved-tip",
+        conversation_session_id="conversation-root",
+    )
+    store.close()
+
+    reopened = _reopen(tmp_path)
+    try:
+        run = reopened.get_run(result.run_id)
+        assert run is not None
+        assert run["conversation_session_id"] == "conversation-root"
+        assert run["session_id"] == "resolved-tip"
+        recovered = reopened.submit_or_get(
+            idempotency_key="k-compressed-session",
+            request_body={"input": "continue", "session_id": "conversation-root"},
+            session_id="resolved-tip",
+            conversation_session_id="conversation-root",
+        )
+        assert recovered.run_id == result.run_id
+        assert recovered.created is False
+    finally:
+        reopened.close()
+
+
 def test_requested_policy_is_set_once_and_same_value_is_idempotent(store) -> None:
     result = store.submit_or_get(idempotency_key="k-policy", request_body=_BODY_A)
 
