@@ -228,6 +228,7 @@ async def test_platform_run_context_reaches_only_current_managed_run_environment
         "HERMES_SESSION_SOURCE": "",
         "HERMES_SESSION_CHAT_ID": "",
         "HERMES_SESSION_CHAT_NAME": "",
+        "HERMES_SESSION_CHAT_TYPE": "",
         "HERMES_SESSION_THREAD_ID": "",
         "HERMES_SESSION_USER_ID": "",
         "HERMES_SESSION_USER_NAME": "",
