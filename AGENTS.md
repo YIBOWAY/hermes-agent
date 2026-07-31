@@ -1287,6 +1287,13 @@ while the agent is blocked (e.g. approval prompts) MUST bypass BOTH
 guards and be dispatched inline, not via `_process_message_background()`
 (which races session lifecycle).
 
+### Preserve API-server single-writer startup ordering
+Acquire durable authority before bind; bind before durable reconciliation.
+Only a supervisor-owned cold start may retry `EADDRINUSE`, using the bounded
+`0.25/0.5/1/2s` schedule. Failure or cancellation must close an owned durable
+store before releasing authority. Never bypass ownership by deleting
+`.authority.lock`. See `docs/api-server-lifecycle-runbook.md`.
+
 ### Squash merges from stale branches silently revert recent fixes
 Before squash-merging a PR, ensure the branch is up to date with `main`
 (`git fetch origin main && git reset --hard origin/main` in the worktree,

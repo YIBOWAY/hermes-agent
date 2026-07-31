@@ -96,6 +96,7 @@ from gateway.platforms.base import (
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
+from gateway.restart import is_gateway_supervisor_process
 from utils import is_truthy_value
 from gateway.durable_runs import DurableRunStore
 from gateway.relay.descriptor import CONTRACT_VERSION as _RELAY_CONTRACT_VERSION
@@ -256,10 +257,17 @@ DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
+SUPERVISED_COLD_START_BIND_RETRY_DELAYS = (0.25, 0.5, 1.0, 2.0)
+STARTUP_CLEANUP_TIMEOUT_SECONDS = 5.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
 _COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
+# A cleanup that cannot prove its listener/runner are gone must retain the
+# adapter (and therefore its durable-authority fence) until cleanup really
+# finishes or the process exits.  This intentionally trades a bounded leak on
+# a fatal path for preventing a second writer from starting beside an orphan.
+_INCOMPLETE_API_SERVER_CLEANUP_GUARDS: set[Any] = set()
 
 
 class ThreadSafeAsyncQueue(asyncio.Queue):
@@ -1604,6 +1612,16 @@ class APIServerAdapter(BasePlatformAdapter):
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
+        self._startup_cleanup_incomplete = False
+        self._startup_cleanup_task: Optional[asyncio.Task] = None
+        self._startup_cleanup_site: Any = None
+        self._startup_cleanup_runner: Any = None
+        self._startup_cleanup_finalizer: Optional[asyncio.Task] = None
+        # Connect and disconnect replace the same app/runner/site ownership
+        # tuple.  Serialize the full lifecycle, not just teardown, so a
+        # disconnect cannot release durable authority underneath a connect
+        # that is suspended in runner.setup()/site.start().
+        self._lifecycle_lock = asyncio.Lock()
         self._response_store = ResponseStore()
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
@@ -9592,7 +9610,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
         return True
 
-    def _close_owned_durable_store_then_release_authority(self) -> None:
+    def _close_owned_durable_store_then_release_authority(self) -> bool:
         """Close factory-owned SQLite while fenced, then release authority.
 
         Startup can fail before ``disconnect()`` is reached (bind, reconcile,
@@ -9603,24 +9621,232 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         durable_store = getattr(self, "_durable_store", None)
         if getattr(self, "_owns_durable_store", False) and durable_store is not None:
-            self._durable_store = None
-            self._owns_durable_store = False
             try:
                 durable_store.close()
             except Exception:
                 logger.debug(
-                    "Failed to close durable run store for %s",
+                    "Failed to close durable run store for %s; retaining authority",
                     self.name,
                     exc_info=True,
                 )
+                return False
         authority_lock = getattr(self, "_durable_authority_lock", None)
         if authority_lock is not None:
-            authority_lock.release()
+            try:
+                authority_lock.release()
+            except Exception:
+                logger.debug(
+                    "Failed to release durable authority for %s",
+                    self.name,
+                    exc_info=True,
+                )
+                return False
+        if getattr(self, "_owns_durable_store", False) and durable_store is not None:
+            self._durable_store = None
+            self._owns_durable_store = False
+        self._durable_authority_lock = None
+        return True
+
+    async def _await_bounded_startup_cleanup(
+        self,
+        awaitable: Any,
+        *,
+        label: str,
+    ) -> tuple[bool, asyncio.Task]:
+        """Bound the caller's wait without cancelling cleanup behind its back.
+
+        Returns whether the caller task was cancelled and the independently
+        owned cleanup task.  A timeout never cancels that task: releasing the
+        durable fence while a cancel-resistant listener cleanup remains live
+        would admit a second writer beside the orphan.
+        """
+        task = asyncio.ensure_future(awaitable)
+        deadline = asyncio.get_running_loop().time() + STARTUP_CLEANUP_TIMEOUT_SECONDS
+        caller_cancelled = False
+        while not task.done():
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            try:
+                done, _pending = await asyncio.wait({task}, timeout=remaining)
+            except asyncio.CancelledError:
+                caller_cancelled = True
+                continue
+            if not done:
+                break
+
+        if not task.done():
+            logger.debug(
+                "Timed out waiting for partially started API %s cleanup after %.1fs; "
+                "retaining durable authority until cleanup really finishes",
+                label,
+                STARTUP_CLEANUP_TIMEOUT_SECONDS,
+            )
+        return caller_cancelled, task
+
+    @staticmethod
+    async def _stop_site_then_cleanup_runner(site: Any, runner: Any) -> None:
+        """Attempt both cleanup layers; runner success can recover site failure."""
+        site_failure: BaseException | None = None
+        if site is not None:
+            try:
+                await site.stop()
+            except BaseException as exc:
+                site_failure = exc
+
+        if runner is not None:
+            # AppRunner.cleanup() owns all registered sites and is therefore the
+            # recovery layer when a direct site.stop() call raises.
+            await runner.cleanup()
+            return
+        if site_failure is not None:
+            raise site_failure
+
+    def _finalize_proven_startup_cleanup(self, *, site: Any, runner: Any) -> bool:
+        """Close/release while fenced, then clear exact startup references."""
+        if not self._close_owned_durable_store_then_release_authority():
+            self._retain_incomplete_startup_cleanup()
+            return False
+        if self._site is site:
+            self._site = None
+        if self._runner is runner:
+            self._runner = None
+        self._app = None
+        self._startup_cleanup_incomplete = False
+        self._startup_cleanup_task = None
+        self._startup_cleanup_site = None
+        self._startup_cleanup_runner = None
+        self._startup_cleanup_finalizer = None
+        _INCOMPLETE_API_SERVER_CLEANUP_GUARDS.discard(self)
+        return True
+
+    def _retain_incomplete_startup_cleanup(self) -> None:
+        self._startup_cleanup_incomplete = True
+        _INCOMPLETE_API_SERVER_CLEANUP_GUARDS.add(self)
+        self._set_fatal_error(
+            "api_server_cleanup_incomplete",
+            "API server cleanup did not complete; durable authority remains fenced "
+            "until cleanup finishes or this process exits.",
+            retryable=False,
+        )
+
+    async def _finish_deferred_startup_cleanup(
+        self,
+        cleanup_task: asyncio.Task,
+        *,
+        site: Any,
+        runner: Any,
+    ) -> None:
+        """Release durable authority only after deferred cleanup proves success."""
+        succeeded = False
+        try:
+            await asyncio.shield(cleanup_task)
+        except BaseException:
+            logger.debug(
+                "Deferred API startup cleanup failed; retaining durable authority",
+                exc_info=True,
+            )
+            self._retain_incomplete_startup_cleanup()
+        else:
+            succeeded = self._finalize_proven_startup_cleanup(
+                site=site,
+                runner=runner,
+            )
+        if not succeeded:
+            # Keep the exact live refs and process guard, but permit a later
+            # explicit cleanup retry to create one new serialized owner.
+            if self._startup_cleanup_task is cleanup_task:
+                self._startup_cleanup_task = None
+                self._startup_cleanup_site = None
+                self._startup_cleanup_runner = None
+            if self._startup_cleanup_finalizer is asyncio.current_task():
+                self._startup_cleanup_finalizer = None
+
+    async def _cleanup_failed_startup(self) -> bool:
+        """Bound the caller while keeping authority fenced behind real cleanup."""
+        cleanup_task = self._startup_cleanup_task
+        finalizer = self._startup_cleanup_finalizer
+        if cleanup_task is None:
+            site = self._site
+            runner = self._runner
+            cleanup_task = asyncio.create_task(
+                self._stop_site_then_cleanup_runner(site, runner)
+            )
+            # Install the single cleanup owner before the first await. Every
+            # concurrent disconnect/nested handler must join this exact task.
+            self._startup_cleanup_task = cleanup_task
+            self._startup_cleanup_site = site
+            self._startup_cleanup_runner = runner
+            finalizer = asyncio.create_task(
+                self._finish_deferred_startup_cleanup(
+                    cleanup_task,
+                    site=site,
+                    runner=runner,
+                )
+            )
+            self._startup_cleanup_finalizer = finalizer
+        else:
+            site = self._startup_cleanup_site
+            runner = self._startup_cleanup_runner
+            if finalizer is None:
+                # The owner task must always have a self-held finalizer. Missing
+                # ownership metadata is itself an incomplete fatal state.
+                self._retain_incomplete_startup_cleanup()
+                return False
+
+        caller_cancelled, _observed_task = await self._await_bounded_startup_cleanup(
+            cleanup_task,
+            label="site/runner",
+        )
+        if not cleanup_task.done():
+            self._retain_incomplete_startup_cleanup()
+            return caller_cancelled
+
+        # Cleanup completed (successfully or otherwise). Wait through repeated
+        # caller cancellation for the one finalizer to make the release choice.
+        while not finalizer.done():
+            try:
+                await asyncio.shield(finalizer)
+            except asyncio.CancelledError:
+                caller_cancelled = True
+        try:
+            finalizer.result()
+        except BaseException:
+            logger.debug(
+                "API startup cleanup finalizer failed; retaining durable authority",
+                exc_info=True,
+            )
+            self._retain_incomplete_startup_cleanup()
+        return caller_cancelled
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        """Serialize listener startup against every teardown path."""
+        async with self._lifecycle_lock:
+            return await self._connect_once(is_reconnect=is_reconnect)
+
+    async def _connect_once(self, *, is_reconnect: bool = False) -> bool:
         """Start the aiohttp web server."""
         if not AIOHTTP_AVAILABLE:
             logger.warning("[%s] aiohttp not installed", self.name)
+            return False
+
+        if self.is_connected:
+            # Treat duplicate serialized connect as idempotent. Rebuilding the
+            # app/runner/site tuple would lose the live listener reference and
+            # let the ensuing EADDRINUSE cleanup tear down the wrong instance.
+            return True
+
+        if (
+            self._startup_cleanup_task is not None
+            or self._startup_cleanup_finalizer is not None
+            or self._startup_cleanup_incomplete
+        ):
+            self._set_fatal_error(
+                "api_server_cleanup_incomplete",
+                "Previous API server cleanup is in progress or incomplete; refusing "
+                "restart while durable authority remains fenced.",
+                retryable=False,
+            )
             return False
 
         if not self._api_key_passes_startup_guard():
@@ -9744,19 +9970,43 @@ class APIServerAdapter(BasePlatformAdapter):
             #   - Linux: SO_REUSEADDR only permits rebinding past TIME_WAIT
             #     (a second live listener needs SO_REUSEPORT, never set), so
             #     keep the default (enabled) for instant restart rebinds.
-            self._site = web.TCPSite(
-                self._runner,
-                self._host,
-                self._port,
-                reuse_address=False if sys.platform == "darwin" else None,
+            bind_retry_delays = iter(
+                SUPERVISED_COLD_START_BIND_RETRY_DELAYS
+                if not is_reconnect and is_gateway_supervisor_process()
+                else ()
             )
             try:
-                await self._site.start()
+                while True:
+                    self._site = web.TCPSite(
+                        self._runner,
+                        self._host,
+                        self._port,
+                        reuse_address=False if sys.platform == "darwin" else None,
+                    )
+                    try:
+                        await self._site.start()
+                        break
+                    except OSError as exc:
+                        if getattr(exc, "errno", None) != errno.EADDRINUSE:
+                            raise
+                        try:
+                            retry_delay = next(bind_retry_delays)
+                        except StopIteration:
+                            raise exc
+                        await self._site.stop()
+                        self._site = None
+                        logger.warning(
+                            "[%s] Port %d is still occupied during supervised "
+                            "cold start; retrying bind in %.2fs",
+                            self.name,
+                            self._port,
+                            retry_delay,
+                        )
+                        await asyncio.sleep(retry_delay)
             except OSError as exc:
-                await self._runner.cleanup()
-                self._runner = None
-                self._site = None
-                self._close_owned_durable_store_then_release_authority()
+                cleanup_cancelled = await self._cleanup_failed_startup()
+                if cleanup_cancelled:
+                    raise asyncio.CancelledError
                 if getattr(exc, "errno", None) == errno.EADDRINUSE:
                     # A port conflict is a configuration error, not a
                     # transient blip — another process holds the port for
@@ -9803,33 +10053,23 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             return True
 
-        except Exception as e:
+        except (Exception, asyncio.CancelledError) as e:
             # A failure after TCPSite.start (notably startup reconciliation)
             # must tear down the listener before releasing DB authority.
-            if self._site is not None:
-                try:
-                    await self._site.stop()
-                except Exception:
-                    logger.debug(
-                        "Failed to stop partially started API site",
-                        exc_info=True,
-                    )
-                self._site = None
-            if self._runner is not None:
-                try:
-                    await self._runner.cleanup()
-                except Exception:
-                    logger.debug(
-                        "Failed to clean partially started API runner",
-                        exc_info=True,
-                    )
-                self._runner = None
-            self._app = None
-            self._close_owned_durable_store_then_release_authority()
+            cleanup_cancelled = await self._cleanup_failed_startup()
+            if isinstance(e, asyncio.CancelledError):
+                raise
+            if cleanup_cancelled:
+                raise asyncio.CancelledError
             logger.error("[%s] Failed to start API server: %s", self.name, e)
             return False
 
     async def disconnect(self) -> None:
+        """Serialize teardown against listener construction."""
+        async with self._lifecycle_lock:
+            await self._disconnect_once()
+
+    async def _disconnect_once(self) -> None:
         """Stop the aiohttp web server and release all owned resources.
 
         Closes the ResponseStore SQLite connection in addition to stopping
@@ -9849,14 +10089,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.debug(
                     "Failed to close response store for %s", self.name, exc_info=True,
                 )
-        if self._site:
-            await self._site.stop()
-            self._site = None
-        if self._runner:
-            await self._runner.cleanup()
-            self._runner = None
-        self._close_owned_durable_store_then_release_authority()
-        self._app = None
+        cleanup_cancelled = await self._cleanup_failed_startup()
+        if cleanup_cancelled:
+            raise asyncio.CancelledError
+        if self._startup_cleanup_incomplete:
+            logger.error(
+                "[%s] API server stop is incomplete; durable authority remains "
+                "fenced until cleanup succeeds or the process exits",
+                self.name,
+            )
+            return
         logger.info("[%s] API server stopped", self.name)
 
     async def send(

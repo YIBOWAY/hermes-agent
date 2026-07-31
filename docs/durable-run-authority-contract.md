@@ -1,15 +1,23 @@
 # DurableRunAuthority — Contract Matrix (V2.1)
 
-> Status: **authoritative contract** for Agent v0.2 Slice V2. Frozen 2026-07-17 on
-> base `0bf44d557f4564c9d7d84cbf7632b02015f00271` (candidate branch
-> `codex/agent-v0-2-durable-runs`, isolated worktree — **no live checkout change**).
+> Contract status: **authoritative normative contract** for Agent v0.2 Slice V2,
+> frozen 2026-07-17 on base
+> `0bf44d557f4564c9d7d84cbf7632b02015f00271`. The implementation-status column in
+> §2 is the historical baseline from that freeze, not a claim about current source,
+> an installed package, or a running process.
 >
 > This matrix is the single alignment baseline for the nine durable-run semantics.
 > Every V2.2–V2.8 implementation slice must cite the rows it satisfies; the V2.11
-> unfakeable acceptance tests are derived directly from §6. **Red line: zero live
-> effect until V2.11 is green and V2.12 (install/restart) is separately authorized.**
+> unfakeable acceptance tests are derived directly from §6.
+>
+> Current source behavior for API-server ownership, bind, reconciliation, and
+> cleanup is documented in §4.1 and
+> [API Server Lifecycle Runbook](api-server-lifecycle-runbook.md). Those statements
+> describe the checked-out source only. They do **not** prove that the same bytes are
+> installed or running, and they do not authorize installation, restart, provider
+> use, dispatch, browser mutation, or a public composer.
 
-> **Current delivery evidence (2026-07-19): ISOLATED CODE COMMITTED / LIVE NOT
+> **Historical delivery snapshot (2026-07-19): ISOLATED CODE COMMITTED / LIVE NOT
 > INSTALLED.** The implementation is committed on
 > `codex/v2-live-integration@a22d21b207661849a78bb236e81192cf5295cbd6`
 > (release parent `b3343a658f62`); live remains
@@ -78,7 +86,10 @@ sub-states, never exposed as top-level status.
 
 ## 2. The nine semantics (normative matrix)
 
-| # | Semantic | Contract requirement | Upstream status (base `0bf44d557`) | V2 slice |
+The status column below is evidence from the frozen base, retained to explain the
+contract's origin. It is not a current source or runtime inventory.
+
+| # | Semantic | Contract requirement | Historical upstream status (base `0bf44d557`) | V2 slice |
 |---|---|---|---|---|
 | 1 | **Idempotency key + canonical digest** | `POST /v1/runs` honors caller `Idempotency-Key`; server computes & persists the canonical digest as part of run identity. | partial — key honored only on `/v1/chat/completions` + `/v1/responses` non-stream (`api_server.py:2791,3889`); `_IdempotencyCache` in-mem TTL300/LRU1000; digest via `repr()` (non-canonical). `POST /v1/runs` has **none** (`:4677,:4750`). | V2.2 |
 | 2 | **submit-or-get + recovery by request identity** | Same request identity ⇒ returns the *same* Run (no duplicate); a by-identity lookup recovers a Run after restart. | partial — durable submit-or-get only at kanban *task* granularity (`hermes_cli/kanban_db.py:2545-2555`); no standalone by-key lookup; none on `/v1/runs`. | V2.3 |
@@ -90,7 +101,7 @@ sub-states, never exposed as top-level status.
 | 8 | **reviewed API contract + behavioral capability probe** | `/v1/capabilities` reports **behavioral** evidence (can it actually submit/persist/interrupt/stream now), not static flags; supports feature negotiation. | partial — five `/v1/runs` endpoints exist; but `features` block is hardcoded literals (`api_server.py:1980-2006`), no handshake, no behavioral probe. Reusable: `relay/descriptor.py` `CONTRACT_VERSION`, `collect_runtime_readiness`. | V2.9 |
 | 9 | **(cross-cutting) durability across restart** | All run-truth (identity, status, events, approval, evidence) persists across process restart. | **missing** — all run state in-memory. | V2.4 (store) underlies 2,3,4,6,7 |
 
-## 3. HTTP contract (target surface)
+## 3. HTTP contract (normative surface)
 
 | Method & path | Purpose | Notes |
 |---|---|---|
@@ -109,6 +120,58 @@ A single content-addressed, append-only SQLite authority (WAL) backing rows 2,3,
 TTL, single-use, CAS version). Mirrors the platform's proven append-only + readiness
 discipline (V1.2A) and reuses upstream assets (`_IdempotencyCache.get_or_set`
 single-flight, `_make_request_fingerprint` upgraded to canonical JSON).
+
+### 4.1 Single-writer authority and startup ordering
+
+When the API broker is enabled, `APIServerAdapter` must acquire a
+`DurableAuthorityLock` for the canonical durable database before creating or
+binding the HTTP listener. The non-expiring, process-scoped lock is held by an
+open file descriptor at `<canonical-db-path>.authority.lock`; process exit or
+crash releases the operating-system lock. A second API server must not reconcile
+or mutate the same database, even when it is configured on a different HTTP port.
+Failure to acquire authority is the non-retryable fatal
+`durable_authority_held`.
+
+The startup order spans factory construction and adapter connection:
+
+1. factory construction acquires durable authority;
+2. while fenced, the factory opens and schema-initializes the durable store;
+3. adapter `connect()` refuses any in-progress or incomplete earlier cleanup,
+   then validates the API-server key and required store;
+4. configure the application and runner;
+5. bind the listener directly, without a separate availability pre-probe;
+6. reconcile durable Runs only after the listener is owned;
+7. start background sweeping and mark the adapter connected.
+
+The complete connect/disconnect bodies share one adapter lifecycle lock. This
+prevents teardown from releasing authority beneath a connect suspended in
+runner setup or listener bind, while duplicate serialized connect calls leave
+the established ownership tuple unchanged.
+
+Because authority acquisition/store open precede the key guard, every factory
+path whose `connect()` is rejected must still call adapter disconnect. Calling
+the store factory alone is resource-owning and requires an explicit close.
+
+A failed bind must not reconcile another instance's Runs or start background
+work. After site/runner cleanup proves success, a factory-owned durable store is
+closed while authority remains held, then authority is released. A borrowed
+store remains open, but the adapter-owned authority fence is released.
+
+The caller's cleanup wait is bounded; authority release is not. The first caller
+installs one shared cleanup owner and finalizer before awaiting; overlapping
+callers join it, and reconnect is refused immediately while either exists. A
+pending, cancelled, or failed cleanup sets non-retryable
+`api_server_cleanup_incomplete`, retains the exact listener/runner/store
+references and durable fence, and refuses reconnect. A self-held finalizer may
+perform close-before-release and clear state only after the original cleanup
+really succeeds. Store-close or authority-release uncertainty also retains the
+references and fence for an exact teardown retry. If cleanup never succeeds,
+the operating-system fence remains held until process exit. Operators must
+never delete the `.authority.lock` file to bypass ownership: file existence is
+not proof of a live owner, and unlinking it can defeat the single-writer fence.
+
+Supervised cold-start handoff and operator recovery are specified in the
+[API Server Lifecycle Runbook](api-server-lifecycle-runbook.md).
 
 ## 5. Capability negotiation
 
@@ -129,15 +192,34 @@ persist, can it interrupt, is the approval bus live) — never a static literal.
    fallback fails explicitly.
 6. Approval and stop repeats are **idempotent**; stale/expired/digest-mismatch never
    changes the original fact.
+7. Two API servers targeting the same durable database cannot both become
+   writer/reconciler authority, even if they use different HTTP ports.
+8. A failed listener bind performs no durable reconciliation; a successful
+   supervised cold-start handoff reconciles only after bind succeeds.
+9. Cancellation during startup removes partial listener/runner state, closes any
+   factory-owned durable store before releasing authority, and re-raises
+   cancellation instead of converting it to a retryable failure.
+10. Concurrent cleanup callers share one teardown owner, reconnect is refused
+    from the first cleanup await onward, and uncertain store close never releases
+    the writer fence.
+11. Reverse connect/disconnect overlap is serialized: teardown cannot release
+    authority while listener construction is still in flight.
 
 **Any failure ⇒ production adapter reports `unavailable`; dispatch stays OFF.**
 
-## 7. Red lines (unchanged for all of V2)
+## 7. Release and runtime red lines
 
-Zero live effect until V2.11 green + V2.12 separately authorized. No real trading, no
-provider/paper/live/broker/Gate/redirect flips, no service start/stop. `chat_write_ready`
-/ browser mutation / worker claim-dispatch / public composer stay **OFF**. All V2 work
-lands in the isolated worktree; the live checkout is untouched.
+The original 2026-07-17 V2 release gate required zero live effect until V2.11
+was green and V2.12 installation/restart was separately authorized. It also
+required provider, paper/live trading, broker, Gate, redirect,
+`chat_write_ready`, browser mutation, worker claim-dispatch, and public composer
+surfaces to remain off. That paragraph is a historical release condition, not
+evidence of the current installed or running state.
+
+Current installed-source and live-runtime claims require fresh identity and
+runtime evidence. Source inspection, unit tests, or this contract alone do not
+authorize an install, restart, service mutation, provider call, dispatch, or
+public cutover.
 
 ## 8. Manual-update compatibility policy
 

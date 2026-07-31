@@ -285,19 +285,22 @@ class DurableRunStore:
                 )
 
     def close(self) -> None:
-        try:
-            with self._lock:
-                try:
-                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                except sqlite3.Error:
-                    pass
-                self._conn.close()
-        finally:
-            # Production construction acquires this fence before SQLite is
-            # opened/schema-initialized.  Keep it through the final checkpoint
-            # and connection close, then release it last.
-            if self.authority_lock is not None:
-                self.authority_lock.release()
+        with self._lock:
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                pass
+            # Do not release writer authority when SQLite cannot prove close.
+            # A replacement process beside an uncertain live connection is
+            # worse than retaining the fence until retry or process exit.
+            self._conn.close()
+        # Production construction acquires this fence before SQLite is
+        # opened/schema-initialized. Keep it through the final checkpoint and
+        # successful connection close, then release it last.
+        if self.authority_lock is not None:
+            authority_lock = self.authority_lock
+            authority_lock.release()
+            self.authority_lock = None
 
     # -- internal write helper: BEGIN IMMEDIATE + commit/rollback -----------
 
