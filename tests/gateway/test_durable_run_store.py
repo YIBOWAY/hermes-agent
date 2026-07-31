@@ -682,6 +682,78 @@ def test_approval_challenge_is_bound_to_exact_pending_entry(store) -> None:
     ) is True
 
 
+def test_unpublished_approval_cleanup_rejects_identity_mismatch(store) -> None:
+    run = store.submit_or_get(idempotency_key="k-cleanup-identity", request_body=_BODY_A)
+    assert store.transition(run.run_id, RunState.RUNNING)
+    challenge = store.issue_approval_challenge(
+        run.run_id,
+        approval_id="apr_cleanup_identity",
+        action_digest="digest-cleanup-identity",
+        ttl_seconds=60,
+    )
+
+    assert store.discard_unpublished_approval_challenge(
+        challenge.challenge_id,
+        run_id=run.run_id,
+        approval_id=challenge.approval_id,
+        action_digest="wrong-digest",
+    ) is False
+    assert store.get_approval_challenge(challenge.challenge_id) is not None
+
+
+def test_unpublished_approval_cleanup_never_deletes_consumed_grant(store) -> None:
+    run = store.submit_or_get(idempotency_key="k-cleanup-consumed", request_body=_BODY_A)
+    assert store.transition(run.run_id, RunState.RUNNING)
+    challenge = store.issue_approval_challenge(
+        run.run_id,
+        approval_id="apr_cleanup_consumed",
+        action_digest="digest-cleanup-consumed",
+        ttl_seconds=60,
+    )
+    assert store.consume_approval(
+        challenge.challenge_id,
+        approval_id=challenge.approval_id,
+        action_digest=challenge.action_digest,
+    ) is True
+
+    assert store.discard_unpublished_approval_challenge(
+        challenge.challenge_id,
+        run_id=run.run_id,
+        approval_id=challenge.approval_id,
+        action_digest=challenge.action_digest,
+    ) is False
+    assert store.get_approval_challenge(challenge.challenge_id)["consumed"] == 1
+
+
+def test_unpublished_approval_cleanup_never_deletes_published_audit(store) -> None:
+    run = store.submit_or_get(idempotency_key="k-cleanup-published", request_body=_BODY_A)
+    assert store.transition(run.run_id, RunState.RUNNING)
+    challenge = store.issue_approval_challenge(
+        run.run_id,
+        approval_id="apr_cleanup_published",
+        action_digest="digest-cleanup-published",
+        ttl_seconds=60,
+    )
+    published = store.append_event(
+        run.run_id,
+        "approval.request",
+        {
+            "event": "approval.request",
+            "run_id": run.run_id,
+            "challenge_id": challenge.challenge_id,
+        },
+    )
+
+    assert store.discard_unpublished_approval_challenge(
+        challenge.challenge_id,
+        run_id=run.run_id,
+        approval_id=challenge.approval_id,
+        action_digest=challenge.action_digest,
+    ) is False
+    assert store.get_approval_challenge(challenge.challenge_id) is not None
+    assert store.replay_events(run.run_id) == [published]
+
+
 def test_approval_is_single_use(store) -> None:
     r = store.submit_or_get(idempotency_key="k-single", request_body=_BODY_A)
     assert store.transition(r.run_id, RunState.RUNNING)

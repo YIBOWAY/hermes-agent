@@ -1024,6 +1024,48 @@ class DurableRunStore:
 
         return self._write(_op)
 
+    def discard_unpublished_approval_challenge(
+        self,
+        challenge_id: str,
+        *,
+        run_id: str,
+        approval_id: str,
+        action_digest: str,
+    ) -> bool:
+        """Delete one exact unconsumed challenge before it becomes observable.
+
+        The API adapter calls this only when the live waiter disappears after
+        durable issue but before the challenge can be bound or published.  An
+        identity mismatch, consumption, or any durable event carrying the
+        challenge makes cleanup fail closed instead of deleting audit history.
+        """
+
+        def _op(conn: sqlite3.Connection) -> bool:
+            row = conn.execute(
+                "SELECT consumed FROM approval_grants"
+                " WHERE challenge_id = ? AND run_id = ? AND approval_id = ?"
+                " AND action_digest = ?",
+                (challenge_id, run_id, approval_id, action_digest),
+            ).fetchone()
+            if row is None or bool(row["consumed"]):
+                return False
+            for event in conn.execute(
+                "SELECT payload_json FROM run_events WHERE run_id = ?",
+                (run_id,),
+            ):
+                payload = json.loads(event["payload_json"])
+                if payload.get("challenge_id") == challenge_id:
+                    return False
+            deleted = conn.execute(
+                "DELETE FROM approval_grants"
+                " WHERE challenge_id = ? AND run_id = ? AND approval_id = ?"
+                " AND action_digest = ? AND consumed = 0",
+                (challenge_id, run_id, approval_id, action_digest),
+            )
+            return deleted.rowcount == 1
+
+        return self._write(_op)
+
     def consume_approval(
         self,
         challenge_id: str,

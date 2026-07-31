@@ -165,6 +165,48 @@ class TestChallengeIssued:
             finally:
                 interrupted.set()
 
+    @pytest.mark.asyncio
+    async def test_waiter_disappearance_after_issue_discards_unpublished_challenge(
+        self, store, monkeypatch
+    ):
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            run_id, mock_agent, interrupted = await _start_live_run(adapter, cli)
+            try:
+                entry = _pending_entry()
+                with approval_mod._lock:
+                    approval_mod._gateway_queues[run_id] = [entry]
+                notify = approval_mod._gateway_notify_cbs[run_id]
+
+                def _disappear_before_binding(*args, **kwargs):
+                    with approval_mod._lock:
+                        approval_mod._gateway_queues.pop(run_id, None)
+                    return False
+
+                monkeypatch.setattr(
+                    approval_mod,
+                    "bind_gateway_approval_deadline",
+                    _disappear_before_binding,
+                )
+                with pytest.raises(RuntimeError, match="challenge unavailable"):
+                    notify(dict(entry.data))
+
+                await asyncio.sleep(0)
+                challenges = store._conn.execute(
+                    "SELECT * FROM approval_grants WHERE run_id = ?", (run_id,)
+                ).fetchall()
+                events = store.replay_events(run_id)
+                assert challenges == []
+                assert not any(
+                    event.event_type == "approval.request" for event in events
+                )
+                assert store.get_run(run_id)["status"] == "running"
+            finally:
+                with approval_mod._lock:
+                    approval_mod._gateway_queues.pop(run_id, None)
+                interrupted.set()
+
     @pytest.mark.parametrize("configured_timeout", [0, -1])
     @pytest.mark.asyncio
     async def test_non_positive_waiter_timeout_never_issues_or_publishes_challenge(

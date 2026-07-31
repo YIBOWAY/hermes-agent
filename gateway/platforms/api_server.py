@@ -8233,6 +8233,15 @@ class APIServerAdapter(BasePlatformAdapter):
                                 approval_id=approval_id,
                                 expires_at=ch.expires_at,
                             ):
+                                if not self._durable_store.discard_unpublished_approval_challenge(
+                                    ch.challenge_id,
+                                    run_id=run_id,
+                                    approval_id=ch.approval_id,
+                                    action_digest=action_digest,
+                                ):
+                                    raise RuntimeError(
+                                        "unpublished approval challenge cleanup failed"
+                                    )
                                 raise RuntimeError(
                                     "approval waiter disappeared before challenge binding"
                                 )
