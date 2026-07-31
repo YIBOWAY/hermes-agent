@@ -268,6 +268,101 @@ def test_replay_from_cursor_has_no_gap_no_dup(store) -> None:
     assert len(seqs) == len(set(seqs))
 
 
+def test_run_event_snapshot_holds_one_consistent_read_across_terminal_finalize(
+    store,
+) -> None:
+    result = store.submit_or_get(
+        idempotency_key="k-snapshot-race",
+        request_body=_BODY_A,
+    )
+    assert store.transition(result.run_id, RunState.RUNNING)
+
+    real_connection = store._conn
+    run_row_selected = threading.Event()
+    release_snapshot = threading.Event()
+
+    class _ReadGateConnection:
+        def __init__(self, connection):
+            self._connection = connection
+            self._gated = False
+
+        def execute(self, sql, parameters=()):
+            cursor = self._connection.execute(sql, parameters)
+            if not self._gated and sql.startswith(
+                "SELECT * FROM runs WHERE run_id = ?"
+            ):
+                self._gated = True
+                run_row_selected.set()
+                assert release_snapshot.wait(timeout=3.0)
+            return cursor
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    store._conn = _ReadGateConnection(real_connection)
+    snapshot_result = {}
+    snapshot_errors = []
+    finalize_started = threading.Event()
+    finalize_done = threading.Event()
+
+    def _read_snapshot():
+        try:
+            snapshot_result["value"] = store.snapshot_run_events(result.run_id)
+        except Exception as exc:  # pragma: no cover - assertion reports exact error
+            snapshot_errors.append(exc)
+
+    def _finalize():
+        finalize_started.set()
+        store.finalize_run(
+            result.run_id,
+            terminal_state=RunState.SUCCEEDED,
+            event_type="run.completed",
+            event_payload={"event": "run.completed", "run_id": result.run_id},
+        )
+        finalize_done.set()
+
+    reader = threading.Thread(target=_read_snapshot)
+    writer = threading.Thread(target=_finalize)
+    try:
+        reader.start()
+        assert run_row_selected.wait(timeout=3.0)
+        writer.start()
+        assert finalize_started.wait(timeout=3.0)
+        assert not finalize_done.wait(timeout=0.1)
+        release_snapshot.set()
+        reader.join(timeout=3.0)
+        writer.join(timeout=3.0)
+    finally:
+        release_snapshot.set()
+        reader.join(timeout=3.0)
+        if writer.ident is not None:
+            writer.join(timeout=3.0)
+        store._conn = real_connection
+
+    assert not snapshot_errors
+    run, events = snapshot_result["value"]
+    assert run["status"] == RunState.RUNNING.value
+    assert events == []
+    assert store.get_run(result.run_id)["status"] == RunState.SUCCEEDED.value
+
+
+def test_run_event_snapshot_limit_checks_raw_rows_before_deserializing(store) -> None:
+    result = store.submit_or_get(
+        idempotency_key="k-snapshot-limit",
+        request_body=_BODY_A,
+    )
+    store.append_event(result.run_id, "message.delta", {"delta": "first"})
+    store._conn.execute(
+        "INSERT INTO run_events"
+        " (event_id, run_id, seq, event_type, payload_json, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        ("evt_invalid", result.run_id, 2, "message.delta", "{not-json", time.time()),
+    )
+
+    with pytest.raises(RuntimeError, match="snapshot.*limit"):
+        store.snapshot_run_events(result.run_id, max_events=1)
+
+
 def test_events_survive_reopen(store, tmp_path) -> None:
     r = store.submit_or_get(idempotency_key="k-evp", request_body=_BODY_A)
     store.append_event(r.run_id, "run.started", {})

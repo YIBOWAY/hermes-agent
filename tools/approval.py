@@ -16,6 +16,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -2487,6 +2488,9 @@ class _ApprovalEntry:
         "reason",
         "active",
         "claimed",
+        "timeout_seconds",
+        "expires_at",
+        "deadline_monotonic",
     )
 
     def __init__(self, data: dict):
@@ -2505,6 +2509,9 @@ class _ApprovalEntry:
         self.event = threading.Event()
         self.data = data          # command, description, pattern_keys, …
         self.result: Optional[str] = None  # "once"|"session"|"always"|"deny"
+        self.timeout_seconds = max(float(_get_approval_timeout()), 0.0)
+        self.expires_at: Optional[float] = None
+        self.deadline_monotonic: Optional[float] = None
         # ``active`` is owned by the waiting thread; ``claimed`` is a short
         # HTTP-side lease that prevents timeout/unregister races while an exact
         # durable decision is being committed before the waiter is signalled.
@@ -2682,6 +2689,66 @@ def has_blocking_approval(
         if approval_id is None:
             return bool(queue)
         return any(entry.approval_id == approval_id for entry in queue)
+
+
+def get_gateway_approval_deadline(
+    session_key: str, *, approval_id: str
+) -> Optional[float]:
+    """Return the exact wall-clock deadline owned by one live waiter."""
+    with _lock:
+        queue = _gateway_queues.get(session_key) or []
+        entry = next(
+            (item for item in queue if item.approval_id == approval_id),
+            None,
+        )
+        if entry is None or not entry.active or entry.event.is_set():
+            return None
+        return entry.expires_at
+
+
+def get_gateway_approval_timeout(
+    session_key: str, *, approval_id: str
+) -> Optional[float]:
+    """Return the configured timeout captured by one live waiter."""
+    with _lock:
+        queue = _gateway_queues.get(session_key) or []
+        entry = next(
+            (item for item in queue if item.approval_id == approval_id),
+            None,
+        )
+        if entry is None or not entry.active or entry.event.is_set():
+            return None
+        return entry.timeout_seconds
+
+
+def bind_gateway_approval_deadline(
+    session_key: str, *, approval_id: str, expires_at: float
+) -> bool:
+    """Bind one live waiter to an exact durable challenge expiry.
+
+    The durable grant and blocking waiter must never disagree about how long an
+    approval is usable. Only private entry fields are updated; no waiter timing
+    internals are added to the user-facing approval payload.
+    """
+    try:
+        candidate = float(expires_at)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(candidate):
+        return False
+
+    with _lock:
+        queue = _gateway_queues.get(session_key) or []
+        entry = next(
+            (item for item in queue if item.approval_id == approval_id),
+            None,
+        )
+        if entry is None or not entry.active or entry.event.is_set():
+            return False
+        entry.expires_at = candidate
+        remaining = max(candidate - time.time(), 0.0)
+        entry.deadline_monotonic = time.monotonic() + remaining
+        return True
 
 
 def submit_pending(session_key: str, approval: dict):
@@ -3856,20 +3923,22 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         )
         return {"resolved": False, "choice": None, "notify_failed": True}
 
-    # Block until the user responds or the canonical approval timeout elapses
-    # (default 300s). Poll in short slices so we can fire activity heartbeats
+    # Block until the user responds or the entry's canonical approval deadline
+    # elapses. Poll in short slices so we can fire activity heartbeats
     # every ~10s to the agent's inactivity tracker — otherwise the gateway
     # watchdog kills the agent while the user is still responding. Mirrors
     # _wait_for_process() cadence.
-    timeout = _get_approval_timeout()
-
     try:
         from tools.environments.base import touch_activity_if_due
     except Exception:  # pragma: no cover
         touch_activity_if_due = None
 
     _now = time.monotonic()
-    _deadline = _now + max(timeout, 0)
+    with _lock:
+        if entry.deadline_monotonic is None:
+            entry.expires_at = time.time() + entry.timeout_seconds
+            entry.deadline_monotonic = _now + entry.timeout_seconds
+        _deadline = entry.deadline_monotonic
     _activity_state = {"last_touch": _now, "start": _now}
     resolved = False
     # The poll loop below is verifiably blocked on a human answer (the user

@@ -16,6 +16,7 @@ Exposes an HTTP server with endpoints:
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}           — retrieve current run status
+- GET  /v1/runs/{run_id}/events/snapshot — finite durable lifecycle-event snapshot
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - POST /v1/runs/{run_id}/approval — resolve a pending run approval
 - POST /v1/runs/{run_id}/stop       — interrupt a running agent
@@ -2304,6 +2305,11 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
             ("POST", "/v1/runs", self._handle_runs),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
+            (
+                "GET",
+                "/v1/runs/{run_id}/events/snapshot",
+                self._handle_run_events_snapshot,
+            ),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
@@ -3510,7 +3516,14 @@ class APIServerAdapter(BasePlatformAdapter):
         # (no-store) payload above is byte-identical to before.
         if self._broker_enabled():
             payload["contract_version"] = RELAY_CONTRACT_VERSION
-            payload["durable"] = self._capability_probes()
+            durable = self._capability_probes()
+            payload["durable"] = durable
+            if durable["event_replay"]["grounded"] is True:
+                payload["features"]["run_events_snapshot"] = True
+                payload["endpoints"]["run_events_snapshot"] = {
+                    "method": "GET",
+                    "path": "/v1/runs/{run_id}/events/snapshot",
+                }
 
         return web.json_response(payload)
 
@@ -6864,7 +6877,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
-    _APPROVAL_CHALLENGE_TTL = 300  # seconds an approval challenge stays consumable
+    _APPROVAL_CHALLENGE_TTL = 300  # maximum seconds a challenge stays consumable
 
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
@@ -8187,16 +8200,42 @@ class APIServerAdapter(BasePlatformAdapter):
                         approval_id = str(event.get("approval_id") or "")
                         action_digest = str(event.get("action_digest") or "")
                         try:
+                            from tools.approval import (
+                                bind_gateway_approval_deadline,
+                                get_gateway_approval_timeout,
+                            )
+
                             if not approval_id or not action_digest:
                                 raise ValueError(
                                     "approval core did not provide exact approval identity"
                                 )
+                            waiter_timeout = get_gateway_approval_timeout(
+                                approval_session_key,
+                                approval_id=approval_id,
+                            )
+                            if waiter_timeout is None:
+                                raise RuntimeError("approval waiter unavailable")
+                            if waiter_timeout <= 0:
+                                raise RuntimeError(
+                                    "approval waiter timeout is not positive"
+                                )
+                            challenge_ttl = min(
+                                float(self._APPROVAL_CHALLENGE_TTL), waiter_timeout
+                            )
                             ch = self._durable_store.issue_approval_challenge(
                                 run_id,
                                 approval_id=approval_id,
                                 action_digest=action_digest,
-                                ttl_seconds=self._APPROVAL_CHALLENGE_TTL,
+                                ttl_seconds=challenge_ttl,
                             )
+                            if not bind_gateway_approval_deadline(
+                                approval_session_key,
+                                approval_id=approval_id,
+                                expires_at=ch.expires_at,
+                            ):
+                                raise RuntimeError(
+                                    "approval waiter disappeared before challenge binding"
+                                )
                             event["challenge_id"] = ch.challenge_id
                             event["approval_id"] = ch.approval_id
                             event["action_digest"] = action_digest
@@ -8576,9 +8615,25 @@ class APIServerAdapter(BasePlatformAdapter):
             if row is None:
                 return self._durable_unavailable_response()
             # Canonical durable lifecycle wins over a stale live projection;
-            # retain only additive live fields such as output/error.
+            # retain only additive live fields such as output/error. The durable
+            # ``running`` state intentionally collapses live substates, though,
+            # so preserve an exact waiting/stopping projection until durable
+            # lifecycle reaches a terminal state.
             try:
-                status = {**status, **self._run_status_from_store(row)}
+                live_status = str(status.get("status") or "")
+                durable_status = self._run_status_from_store(row)
+                status = {**status, **durable_status}
+                if durable_status.get("status") == "running":
+                    if live_status == "waiting_for_approval":
+                        from tools.approval import has_blocking_approval
+
+                        if has_blocking_approval(run_id):
+                            status["status"] = live_status
+                    elif (
+                        live_status == "stopping"
+                        and run_id in self._stopping_run_ids
+                    ):
+                        status["status"] = live_status
             except DurableEvidenceError:
                 logger.exception(
                     "[api_server] durable evidence is corrupt for %s", run_id
@@ -8633,6 +8688,78 @@ class APIServerAdapter(BasePlatformAdapter):
         }
         status.update(self._evidence_from_row(row))
         return status
+
+    async def _handle_run_events_snapshot(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """GET a finite, gap-free snapshot of one run's durable events."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        if not self._broker_enabled():
+            return self._durable_unavailable_response()
+
+        run_id = request.match_info["run_id"]
+        try:
+            snapshot = self._durable_store.snapshot_run_events(run_id)
+            if snapshot is None:
+                if run_id in self._run_statuses:
+                    return self._durable_unavailable_response()
+                return web.json_response(
+                    _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                    status=404,
+                )
+            durable_run, records = snapshot
+        except Exception:
+            logger.exception(
+                "[api_server] durable event snapshot lookup failed for %s", run_id
+            )
+            return self._durable_unavailable_response()
+
+        durable_status = str(durable_run.get("status") or "")
+        if durable_run.get("run_id") != run_id or durable_status not in {
+            "queued",
+            "running",
+            "succeeded",
+            "failed",
+            "stopped",
+        }:
+            return self._durable_unavailable_response()
+
+        events: List[Dict[str, Any]] = []
+        event_ids = set()
+        for expected_seq, record in enumerate(records, start=1):
+            seq = getattr(record, "seq", None)
+            event_type = getattr(record, "event_type", None)
+            event_id = getattr(record, "event_id", None)
+            if (
+                getattr(record, "run_id", None) != run_id
+                or type(seq) is not int
+                or seq != expected_seq
+                or not isinstance(event_type, str)
+                or not event_type
+                or not isinstance(event_id, str)
+                or not event_id
+                or event_id in event_ids
+                or not isinstance(getattr(record, "payload", None), dict)
+            ):
+                return self._durable_unavailable_response()
+            event_ids.add(event_id)
+            events.append({
+                **record.payload,
+                "run_id": record.run_id,
+                "seq": seq,
+                "event": event_type,
+                "event_id": event_id,
+            })
+
+        return web.json_response({
+            "object": "hermes.run_event.snapshot",
+            "run_id": run_id,
+            "events": events,
+            "head_seq": events[-1]["seq"] if events else 0,
+            "terminal": durable_status in {"succeeded", "failed", "stopped"},
+        })
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
         """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""

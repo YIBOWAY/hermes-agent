@@ -27,12 +27,13 @@ from aiohttp.test_utils import TestClient, TestServer
 from unittest.mock import MagicMock, patch
 
 from gateway.config import PlatformConfig
-from gateway.durable_runs import DurableRunStore
+from gateway.durable_runs import DurableRunStore, RunState
 from gateway.platforms.api_server import (
     APIServerAdapter,
     cors_middleware,
     security_headers_middleware,
 )
+from tools import approval as approval_mod
 
 _TIMEOUT = aiohttp.ClientTimeout(total=20, sock_connect=5, sock_read=15)
 
@@ -139,6 +140,120 @@ class TestStoreEvidence:
 
 
 class TestAdapterEvidence:
+    @pytest.mark.parametrize("live_substate", ["waiting_for_approval", "stopping"])
+    @pytest.mark.asyncio
+    async def test_live_running_substate_survives_durable_running_merge(
+        self, store, live_substate
+    ):
+        run_id = f"run_live_{live_substate}"
+        store.register_run(run_id=run_id, session_id="s")
+        assert store.transition(run_id, RunState.RUNNING)
+        adapter = _make_adapter(durable_store=store)
+        adapter._run_statuses[run_id] = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": live_substate,
+            "last_event": f"run.{live_substate}",
+        }
+        if live_substate == "waiting_for_approval":
+            entry = approval_mod._ApprovalEntry({"command": "echo guarded"})
+            with approval_mod._lock:
+                approval_mod._gateway_queues[run_id] = [entry]
+        else:
+            adapter._stopping_run_ids.add(run_id)
+        app = _create_runs_app(adapter)
+
+        try:
+            async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+                response = await cli.get(f"/v1/runs/{run_id}")
+                payload = await response.json()
+        finally:
+            with approval_mod._lock:
+                approval_mod._gateway_queues.pop(run_id, None)
+            adapter._stopping_run_ids.discard(run_id)
+
+        assert response.status == 200
+        assert payload["status"] == "running"
+        assert payload["substate"] == live_substate
+        assert payload["last_event"] == f"run.{live_substate}"
+
+    @pytest.mark.asyncio
+    async def test_cleared_waiter_drops_stale_waiting_substate(self, store):
+        run_id = "run_cleared_waiter"
+        store.register_run(run_id=run_id, session_id="s")
+        assert store.transition(run_id, RunState.RUNNING)
+        adapter = _make_adapter(durable_store=store)
+        adapter._run_statuses[run_id] = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "waiting_for_approval",
+            "last_event": "approval.request",
+        }
+        entry = approval_mod._ApprovalEntry({"command": "echo guarded"})
+        with approval_mod._lock:
+            approval_mod._gateway_queues[run_id] = [entry]
+        approval_mod.unregister_gateway_notify(run_id)
+        assert entry.event.is_set()
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            response = await cli.get(f"/v1/runs/{run_id}")
+            payload = await response.json()
+
+        assert response.status == 200
+        assert payload["status"] == "running"
+        assert "substate" not in payload
+
+    @pytest.mark.asyncio
+    async def test_cleared_stop_authority_drops_stale_stopping_substate(self, store):
+        run_id = "run_cleared_stop"
+        store.register_run(run_id=run_id, session_id="s")
+        assert store.transition(run_id, RunState.RUNNING)
+        adapter = _make_adapter(durable_store=store)
+        adapter._run_statuses[run_id] = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "stopping",
+            "last_event": "run.stopping",
+        }
+        adapter._stopping_run_ids.discard(run_id)
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            response = await cli.get(f"/v1/runs/{run_id}")
+            payload = await response.json()
+
+        assert response.status == 200
+        assert payload["status"] == "running"
+        assert "substate" not in payload
+
+    @pytest.mark.parametrize(
+        "terminal_state", [RunState.SUCCEEDED, RunState.FAILED, RunState.STOPPED]
+    )
+    @pytest.mark.asyncio
+    async def test_durable_terminal_lifecycle_wins_over_live_substate(
+        self, store, terminal_state
+    ):
+        run_id = f"run_durable_{terminal_state.value}"
+        store.register_run(run_id=run_id, session_id="s")
+        assert store.transition(run_id, RunState.RUNNING)
+        assert store.transition(run_id, terminal_state)
+        adapter = _make_adapter(durable_store=store)
+        adapter._run_statuses[run_id] = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "waiting_for_approval",
+        }
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            response = await cli.get(f"/v1/runs/{run_id}")
+            payload = await response.json()
+
+        assert response.status == 200
+        assert payload["status"] == terminal_state.value
+        assert "substate" not in payload
+
     @pytest.mark.asyncio
     async def test_create_agent_failure_does_not_counterfeit_actual_or_usage(
         self, store

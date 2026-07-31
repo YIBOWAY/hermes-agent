@@ -140,6 +140,119 @@ class TestChallengeIssued:
                 interrupted.set()
 
     @pytest.mark.asyncio
+    async def test_missing_waiter_never_issues_or_publishes_challenge(self, store):
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            run_id, mock_agent, interrupted = await _start_live_run(adapter, cli)
+            try:
+                notify = approval_mod._gateway_notify_cbs[run_id]
+                entry = _pending_entry()
+
+                with pytest.raises(RuntimeError, match="challenge unavailable"):
+                    notify(dict(entry.data))
+
+                await asyncio.sleep(0)
+                challenges = store._conn.execute(
+                    "SELECT * FROM approval_grants WHERE run_id = ?", (run_id,)
+                ).fetchall()
+                events = store.replay_events(run_id)
+                assert challenges == []
+                assert not any(
+                    event.event_type == "approval.request" for event in events
+                )
+                assert store.get_run(run_id)["status"] == "running"
+            finally:
+                interrupted.set()
+
+    @pytest.mark.parametrize("configured_timeout", [0, -1])
+    @pytest.mark.asyncio
+    async def test_non_positive_waiter_timeout_never_issues_or_publishes_challenge(
+        self, store, monkeypatch, configured_timeout
+    ):
+        monkeypatch.setattr(
+            approval_mod, "_get_approval_timeout", lambda: configured_timeout
+        )
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            run_id, mock_agent, interrupted = await _start_live_run(adapter, cli)
+            try:
+                entry = _pending_entry()
+                with approval_mod._lock:
+                    approval_mod._gateway_queues[run_id] = [entry]
+                notify = approval_mod._gateway_notify_cbs[run_id]
+
+                with pytest.raises(RuntimeError, match="challenge unavailable"):
+                    notify(dict(entry.data))
+
+                await asyncio.sleep(0)
+                challenges = store._conn.execute(
+                    "SELECT * FROM approval_grants WHERE run_id = ?", (run_id,)
+                ).fetchall()
+                events = store.replay_events(run_id)
+                assert challenges == []
+                assert not any(
+                    event.event_type == "approval.request" for event in events
+                )
+                assert store.get_run(run_id)["status"] == "running"
+            finally:
+                with approval_mod._lock:
+                    approval_mod._gateway_queues.pop(run_id, None)
+                interrupted.set()
+
+    @pytest.mark.parametrize(
+        ("configured_timeout", "expected_ttl"),
+        [(60, 60), (600, 300)],
+    )
+    @pytest.mark.asyncio
+    async def test_challenge_expiry_matches_canonical_waiter_deadline(
+        self, store, monkeypatch, configured_timeout, expected_ttl
+    ):
+        monkeypatch.setattr(
+            approval_mod, "_get_approval_timeout", lambda: configured_timeout
+        )
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            run_id, mock_agent, interrupted = await _start_live_run(adapter, cli)
+            try:
+                entry = _pending_entry()
+                with approval_mod._lock:
+                    approval_mod._gateway_queues[run_id] = [entry]
+
+                notify = approval_mod._gateway_notify_cbs[run_id]
+                notify(dict(entry.data))
+                await asyncio.sleep(0)
+                challenge = dict(
+                    store._conn.execute(
+                        "SELECT * FROM approval_grants WHERE run_id = ?", (run_id,)
+                    ).fetchone()
+                )
+                request_event = next(
+                    event
+                    for event in store.replay_events(run_id)
+                    if event.event_type == "approval.request"
+                )
+
+                assert challenge[
+                    "expires_at"
+                ] == approval_mod.get_gateway_approval_deadline(
+                    run_id, approval_id=entry.approval_id
+                )
+                assert challenge["expires_at"] - challenge[
+                    "created_at"
+                ] == pytest.approx(expected_ttl, abs=0.1)
+                assert request_event.payload["expires_at"] == challenge["expires_at"]
+                assert "approval_timeout_seconds" not in request_event.payload
+                assert "deadline_monotonic" not in request_event.payload
+                assert not any(key.startswith("_") for key in request_event.payload)
+            finally:
+                with approval_mod._lock:
+                    approval_mod._gateway_queues.pop(run_id, None)
+                interrupted.set()
+
+    @pytest.mark.asyncio
     async def test_challenge_store_failure_never_publishes_unanswerable_request(
         self, store, monkeypatch
     ):
@@ -149,13 +262,16 @@ class TestChallengeIssued:
             run_id, mock_agent, interrupted = await _start_live_run(adapter, cli)
             try:
                 notify = approval_mod._gateway_notify_cbs[run_id]
+                entry = _pending_entry()
+                with approval_mod._lock:
+                    approval_mod._gateway_queues[run_id] = [entry]
 
                 def _fail(*args, **kwargs):
                     raise OSError("approval store unavailable")
 
                 monkeypatch.setattr(store, "issue_approval_challenge", _fail)
                 with pytest.raises(RuntimeError, match="challenge unavailable"):
-                    notify(dict(_pending_entry().data))
+                    notify(dict(entry.data))
 
                 await asyncio.sleep(0)
                 assert store.get_run(run_id)["status"] == "running"
@@ -164,6 +280,8 @@ class TestChallengeIssued:
                     for event in store.replay_events(run_id)
                 )
             finally:
+                with approval_mod._lock:
+                    approval_mod._gateway_queues.pop(run_id, None)
                 interrupted.set()
 
 
@@ -372,9 +490,11 @@ class TestApprovalConsumeDoesNotBurnOnNonSuccess:
         async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
             run_id, mock_agent, interrupted = await _start_live_run(adapter, cli)
             try:
-                # Issue a real challenge via notify path, but do NOT enqueue a
-                # pending approval entry — simulates drained/raced queue.
+                # Issue a real challenge against its canonical live waiter,
+                # then drain the queue to simulate a later resolver race.
                 entry = _pending_entry()
+                with approval_mod._lock:
+                    approval_mod._gateway_queues[run_id] = [entry]
                 notify = approval_mod._gateway_notify_cbs.get(run_id)
                 assert notify is not None
                 notify(dict(entry.data))

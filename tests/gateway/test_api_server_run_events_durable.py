@@ -29,7 +29,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from unittest.mock import MagicMock, patch
 
 from gateway.config import PlatformConfig
-from gateway.durable_runs import DurableRunStore
+from gateway.durable_runs import DurableRunStore, RunState
 from gateway.platforms.api_server import (
     APIServerAdapter,
     cors_middleware,
@@ -55,6 +55,10 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app["api_server_adapter"] = adapter
     app.router.add_post("/v1/runs", adapter._handle_runs)
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
+    app.router.add_get(
+        "/v1/runs/{run_id}/events/snapshot",
+        adapter._handle_run_events_snapshot,
+    )
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
     app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
@@ -129,6 +133,178 @@ def _deltas(events):
 
 
 class TestDurableEventPersistence:
+    @pytest.mark.asyncio
+    async def test_nonterminal_snapshot_returns_approval_request_immediately(
+        self, store
+    ):
+        run_id = "run_waiting_for_approval"
+        store.register_run(run_id=run_id, session_id="s")
+        assert store.transition(run_id, RunState.RUNNING)
+        record = store.append_event(
+            run_id,
+            "approval.request",
+            {
+                "event": "approval.request",
+                "run_id": run_id,
+                "approval_id": "apr_1",
+            },
+        )
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            response = await asyncio.wait_for(
+                cli.get(f"/v1/runs/{run_id}/events/snapshot"),
+                timeout=1.0,
+            )
+            payload = await response.json()
+
+        assert response.status == 200
+        assert set(payload) == {"object", "run_id", "events", "head_seq", "terminal"}
+        assert payload["object"] == "hermes.run_event.snapshot"
+        assert payload["run_id"] == run_id
+        assert payload["head_seq"] == record.seq
+        assert payload["terminal"] is False
+        assert payload["events"] == [
+            {
+                "event": "approval.request",
+                "run_id": run_id,
+                "approval_id": "apr_1",
+                "seq": record.seq,
+                "event_id": record.event_id,
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_snapshot_forces_canonical_run_identity_over_payload(self, store):
+        run_id = "run_snapshot_identity"
+        store.register_run(run_id=run_id, session_id="s")
+        store.append_event(
+            run_id,
+            "approval.request",
+            {"event": "forged.event", "run_id": "run_forged"},
+        )
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            response = await cli.get(f"/v1/runs/{run_id}/events/snapshot")
+            payload = await response.json()
+
+        assert response.status == 200
+        assert payload["events"][0]["run_id"] == run_id
+        assert payload["events"][0]["event"] == "approval.request"
+
+    @pytest.mark.asyncio
+    async def test_snapshot_requires_bearer_auth_when_configured(self, store):
+        run_id = "run_snapshot_auth"
+        store.register_run(run_id=run_id, session_id="s")
+        adapter = _make_adapter(durable_store=store, api_key="sk-snapshot")
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            denied = await cli.get(f"/v1/runs/{run_id}/events/snapshot")
+            allowed = await cli.get(
+                f"/v1/runs/{run_id}/events/snapshot",
+                headers={"Authorization": "Bearer sk-snapshot"},
+            )
+
+        assert denied.status == 401
+        assert allowed.status == 200
+
+    @pytest.mark.asyncio
+    async def test_snapshot_unknown_run_is_not_found(self, store):
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            response = await cli.get("/v1/runs/run_missing/events/snapshot")
+            payload = await response.json()
+
+        assert response.status == 404
+        assert payload["error"]["code"] == "run_not_found"
+
+    @pytest.mark.asyncio
+    async def test_snapshot_without_durable_store_fails_closed(self):
+        adapter = _make_adapter(durable_store=None)
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            response = await cli.get("/v1/runs/run_unknown/events/snapshot")
+            payload = await response.json()
+
+        assert response.status == 503
+        assert payload["error"]["code"] == "durable_unavailable"
+
+    @pytest.mark.asyncio
+    async def test_snapshot_replay_failure_fails_closed(self, store, monkeypatch):
+        run_id = "run_snapshot_store_failure"
+        store.register_run(run_id=run_id, session_id="s")
+        monkeypatch.setattr(
+            store,
+            "snapshot_run_events",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("db unavailable")),
+        )
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            response = await cli.get(f"/v1/runs/{run_id}/events/snapshot")
+            payload = await response.json()
+
+        assert response.status == 503
+        assert payload["error"]["code"] == "durable_unavailable"
+
+    @pytest.mark.asyncio
+    async def test_snapshot_over_hard_event_limit_fails_closed_without_partial_page(
+        self, store
+    ):
+        run_id = "run_snapshot_over_limit"
+        store.register_run(run_id=run_id, session_id="s")
+        rows = [
+            (
+                f"evt_limit_{seq}",
+                run_id,
+                seq,
+                "message.delta",
+                json.dumps({"delta": str(seq)}) if seq <= 4096 else "{not-json",
+                float(seq),
+            )
+            for seq in range(1, 4098)
+        ]
+        with store._lock:
+            store._conn.execute("BEGIN IMMEDIATE")
+            try:
+                store._conn.executemany(
+                    "INSERT INTO run_events"
+                    " (event_id, run_id, seq, event_type, payload_json, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    rows[:-1],
+                )
+                store._conn.execute("COMMIT")
+            except Exception:
+                store._conn.execute("ROLLBACK")
+                raise
+        exact_limit = store.snapshot_run_events(run_id)
+        assert exact_limit is not None
+        assert len(exact_limit[1]) == 4096
+        store._conn.execute(
+            "INSERT INTO run_events"
+            " (event_id, run_id, seq, event_type, payload_json, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            rows[-1],
+        )
+        adapter = _make_adapter(durable_store=store)
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app), timeout=_TIMEOUT) as cli:
+            response = await cli.get(f"/v1/runs/{run_id}/events/snapshot")
+            payload = await response.json()
+
+        assert response.status == 503
+        assert payload["error"]["code"] == "durable_unavailable"
+        assert "events" not in payload
+
     @pytest.mark.asyncio
     async def test_sse_registration_lookup_failure_is_stable_503(
         self, store, monkeypatch

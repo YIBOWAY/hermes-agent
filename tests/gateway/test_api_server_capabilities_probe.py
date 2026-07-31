@@ -98,9 +98,22 @@ class TestLegacyUnchanged:
         # Additive probe keys are ABSENT without a store.
         assert "contract_version" not in data
         assert "durable" not in data
+        assert "run_events_snapshot" not in data["features"]
+        assert "run_events_snapshot" not in data["endpoints"]
 
 
 class TestDurableProbePresent:
+    @pytest.mark.asyncio
+    async def test_grounded_store_advertises_event_snapshot_endpoint(self, store):
+        adapter = _make_adapter(durable_store=store)
+        data = await _get_caps(adapter)
+
+        assert data["features"]["run_events_snapshot"] is True
+        assert data["endpoints"]["run_events_snapshot"] == {
+            "method": "GET",
+            "path": "/v1/runs/{run_id}/events/snapshot",
+        }
+
     @pytest.mark.asyncio
     async def test_contract_version_present_with_store(self, store):
         """A configured store surfaces a contract_version for schema negotiation."""
@@ -239,6 +252,8 @@ class TestProbeGrounding:
             assert durable[cap]["grounded"] is False, (
                 f"{cap} must not be grounded when its probe fails"
             )
+        assert "run_events_snapshot" not in data["features"]
+        assert "run_events_snapshot" not in data["endpoints"]
 
     @pytest.mark.asyncio
     async def test_readable_but_unwritable_store_is_not_grounded(self):

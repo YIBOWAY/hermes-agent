@@ -57,6 +57,8 @@ TERMINAL_STATES = frozenset(
     {RunState.SUCCEEDED, RunState.FAILED, RunState.STOPPED}
 )
 
+RUN_EVENT_SNAPSHOT_MAX_EVENTS = 4096
+
 # Allowed transitions. Terminal states have no outgoing edges (immutable).
 _ALLOWED_TRANSITIONS = {
     RunState.QUEUED: frozenset(
@@ -77,6 +79,10 @@ class ConflictError(RuntimeError):
 
 class TerminalStateError(RuntimeError):
     """A transition was attempted out of an immutable terminal state."""
+
+
+class RunEventSnapshotLimitExceeded(RuntimeError):
+    """A complete authoritative event snapshot exceeds its bounded contract."""
 
 
 # ---------------------------------------------------------------------------
@@ -757,6 +763,50 @@ class DurableRunStore:
             )
             for r in rows
         ]
+
+    def snapshot_run_events(
+        self,
+        run_id: str,
+        *,
+        max_events: int = RUN_EVENT_SNAPSHOT_MAX_EVENTS,
+    ) -> Optional[tuple[dict[str, Any], list[RunEvent]]]:
+        """Atomically read one run and its complete bounded event history.
+
+        The run row and event rows share one authority lock, so finalization
+        cannot advance lifecycle between the two reads. The SQL query fetches
+        at most one row beyond the hard bound and rejects overflow before JSON
+        deserialization; callers never receive a partial authority snapshot.
+        """
+        if type(max_events) is not int or max_events <= 0:
+            raise ValueError("max_events must be a positive integer")
+
+        with self._lock:
+            run_row = self._conn.execute(
+                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if run_row is None:
+                return None
+            event_rows = self._conn.execute(
+                "SELECT event_id, run_id, seq, event_type, payload_json, created_at"
+                " FROM run_events WHERE run_id = ? ORDER BY seq ASC LIMIT ?",
+                (run_id, max_events + 1),
+            ).fetchall()
+            if len(event_rows) > max_events:
+                raise RunEventSnapshotLimitExceeded(
+                    f"run event snapshot exceeds limit of {max_events} events"
+                )
+            events = [
+                RunEvent(
+                    event_id=row["event_id"],
+                    run_id=row["run_id"],
+                    seq=row["seq"],
+                    event_type=row["event_type"],
+                    payload=json.loads(row["payload_json"]),
+                    created_at=row["created_at"],
+                )
+                for row in event_rows
+            ]
+            return dict(run_row), events
 
     def probe_capabilities(self) -> dict[str, bool]:
         """Exercise durable semantics in one transaction and always roll back.
