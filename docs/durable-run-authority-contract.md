@@ -40,6 +40,16 @@
 > middleware short-circuit, provider exception, requested route, and fallback
 > config never counterfeit actual evidence. Public evidence contains only the
 > observed model/provider, not fallback secrets or routing configuration.
+>
+> Current source also exposes an authenticated, broker-only
+> `GET /v1/runs/{run_id}/events/snapshot` read. It returns one complete,
+> bounded (4,096-event) durable-authority snapshot and fails closed instead of
+> returning a partial or corrupt history. Approval challenge publication is
+> coupled to the exact live waiter: the challenge TTL cannot outlive the waiter,
+> binding succeeds before `approval.request` becomes observable, and a waiter
+> that disappears between durable issue and binding triggers exact cleanup of
+> only that unconsumed, unpublished challenge. Consumed grants and published
+> audit facts are never deleted by that cleanup path.
 
 The platform must never *project* fake upstream run state. All run truth lives in
 Hermes' canonical authority; the platform reads it through `OfficialHermesHttpAdapter`
@@ -107,6 +117,7 @@ contract's origin. It is not a current source or runtime inventory.
 |---|---|---|
 | `POST /v1/runs` | submit-or-get by request identity | 202 + `run_id`; honors `Idempotency-Key`; persists canonical digest |
 | `GET /v1/runs/{run_id}` | current status + evidence | 404 `run_not_found`; includes requested/actual policy, usage, fallback |
+| `GET /v1/runs/{run_id}/events/snapshot` | finite durable-authority event snapshot | complete contiguous history + `head_seq` and boolean `terminal`; read `GET /v1/runs/{run_id}` for the exact status; bounded at 4,096 events; never returns a partial snapshot; advertised only when the event-replay probe is grounded |
 | `GET /v1/runs/{run_id}/events?since={cursor}` | page replay (no gap/dup) + SSE live tail | honors `Last-Event-ID` / `since`; stable `event_id` + monotonic `seq` |
 | `POST /v1/runs/{run_id}/approval` | respond to an exact challenge | single-use + TTL + CAS; reports committed decision and confirmed/unknown waiter signal separately; 409 on stale/expired/digest-mismatch |
 | `POST /v1/runs/{run_id}/stop` | idempotent stop intent | repeat ⇒ same result, even after terminal |
