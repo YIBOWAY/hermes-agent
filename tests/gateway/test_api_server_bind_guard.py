@@ -8,6 +8,7 @@ import asyncio
 import errno
 import os
 import socket
+import sys
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -268,7 +269,8 @@ class TestBindMechanics:
             if call.args and call.args[0] > 0
         ]
         assert retry_delays
-        assert sum(retry_delays) <= 5
+        assert retry_delays == list(SUPERVISED_COLD_START_BIND_RETRY_DELAYS)
+        assert sum(retry_delays) <= (24 if sys.platform == "darwin" else 5)
         assert create_server.await_count == len(retry_delays) + 1
         reconcile.assert_not_called()
         assert adapter.has_fatal_error is True

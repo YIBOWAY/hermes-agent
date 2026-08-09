@@ -258,7 +258,17 @@ DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
-SUPERVISED_COLD_START_BIND_RETRY_DELAYS = (0.25, 0.5, 1.0, 2.0)
+# macOS deliberately disables SO_REUSEADDR below because BSD can otherwise
+# split traffic across two live listeners. After a clean supervised stop, the
+# kernel may therefore keep the port unavailable for roughly one TCP 2MSL
+# window even though no process owns a LISTEN socket. Give only the macOS cold
+# start path enough bounded time to cross that window; reconnects and genuine
+# conflicts still fail closed after the finite schedule.
+SUPERVISED_COLD_START_BIND_RETRY_DELAYS = (
+    (0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 8.0)
+    if sys.platform == "darwin"
+    else (0.25, 0.5, 1.0, 2.0)
+)
 STARTUP_CLEANUP_TIMEOUT_SECONDS = 5.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
