@@ -226,7 +226,7 @@ async def test_platform_run_context_reaches_only_current_managed_run_environment
     assert captured["child_env"] == {
         "HERMES_SESSION_PLATFORM": "api_server",
         "HERMES_SESSION_SOURCE": "",
-        "HERMES_SESSION_CHAT_ID": "",
+        "HERMES_SESSION_CHAT_ID": "web_managed_1",
         "HERMES_SESSION_CHAT_NAME": "",
         "HERMES_SESSION_CHAT_TYPE": "",
         "HERMES_SESSION_THREAD_ID": "",
@@ -237,6 +237,7 @@ async def test_platform_run_context_reaches_only_current_managed_run_environment
         "HERMES_UI_SESSION_ID": "",
         "HERMES_SESSION_MESSAGE_ID": "",
         "HERMES_SESSION_PROFILE": "",
+        "HERMES_CRON_SESSION": "",
         "HERMES_PLATFORM_COMMAND_ID": "command-7",
         "HERMES_PLATFORM_SESSION_ID": "platform-session-5",
         "HERMES_PLATFORM_RUN_ID": body["run_id"],
